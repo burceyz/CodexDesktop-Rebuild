@@ -18,7 +18,10 @@
 const fs = require("fs");
 const path = require("path");
 const { execSync, execFileSync } = require("child_process");
-const { getCodexBinarySource } = require("./codex-binary-policy");
+const {
+  getCodexBinarySource,
+  getCometixCodexPackageSpec,
+} = require("./codex-binary-policy");
 
 const SRC = path.join(__dirname, "..", "src");
 const PROJECT_ROOT = path.join(__dirname, "..");
@@ -128,19 +131,20 @@ function ensureVendorExtracted(platform) {
   if (fs.existsSync(oldPath)) { _vendorRootCache = oldPath; return oldPath; }
 
   // 3. npm pack platform package
-  const PLAT_SUFFIX = {
-    "linux-x64": "linux-x64", "linux-arm64": "linux-arm64",
-    "mac-arm64": "darwin-arm64", "mac-x64": "darwin-x64", "win": "win32-x64",
-  };
-  const suffix = PLAT_SUFFIX[platform];
-  if (!suffix) return null;
-
-  let baseVer;
+  let spec;
   try {
-    baseVer = execSync("npm view @cometix/codex version", { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
-  } catch { return null; }
+    const distTags = JSON.parse(
+      execSync("npm view @cometix/codex dist-tags --json", {
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "pipe"],
+      }),
+    );
+    spec = getCometixCodexPackageSpec(platform, distTags);
+  } catch (error) {
+    console.log(`   [!] unable to resolve @cometix/codex package: ${error.message}`);
+    return null;
+  }
 
-  const spec = `@cometix/codex@${baseVer}-${suffix}`;
   console.log(`   [vendor] fetching ${spec} via npm pack...`);
   const tmpDir = path.join(require("os").tmpdir(), "cometix-codex-pack");
   fs.mkdirSync(tmpDir, { recursive: true });

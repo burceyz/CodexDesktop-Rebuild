@@ -10,7 +10,10 @@ const {
   keepUpstreamCodex,
   patchWindowsAsarIntegrity,
 } = require("./build-from-upstream");
-const { getCodexBinarySource } = require("./codex-binary-policy");
+const {
+  getCodexBinarySource,
+  getCometixCodexPackageSpec,
+} = require("./codex-binary-policy");
 
 function createTemporaryOutput(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "codex-dmg-test-"));
@@ -104,6 +107,27 @@ test("macOS 和 Windows 保留上游 CLI，Linux 使用平台替换包", () => {
   assert.equal(getCodexBinarySource("linux-x64"), "cometix");
   assert.equal(getCodexBinarySource("linux-arm64"), "cometix");
   assert.throws(() => getCodexBinarySource("freebsd-x64"), /Unsupported Codex binary platform/);
+});
+
+test("Cometix 平台包使用架构 dist-tag 而不是拼接主包版本", () => {
+  const distTags = {
+    latest: "0.144.4-cometix",
+    "linux-x64": "0.144.3-cometix-linux-x64",
+    "linux-arm64": "0.144.4-cometix-linux-arm64",
+  };
+
+  assert.equal(
+    getCometixCodexPackageSpec("linux-x64", distTags),
+    "@cometix/codex@0.144.3-cometix-linux-x64",
+  );
+  assert.equal(
+    getCometixCodexPackageSpec("linux-arm64", distTags),
+    "@cometix/codex@0.144.4-cometix-linux-arm64",
+  );
+  assert.throws(
+    () => getCometixCodexPackageSpec("linux-x64", { latest: distTags.latest }),
+    /Missing @cometix\/codex dist-tag/,
+  );
 });
 
 test("保留上游 CLI 时不会改写二进制", (t) => {
