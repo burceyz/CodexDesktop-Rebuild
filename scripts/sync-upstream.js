@@ -6,7 +6,7 @@
  *   src/{platform}/
  *     _asar/              Extracted app.asar content (patch target)
  *     app.asar.unpacked/  Native modules (kept as-is from upstream)
- *     codex|codex.exe     CLI binary (Windows keeps upstream; Linux uses @cometix/codex later)
+ *     codex|codex.exe     CLI binary (macOS/Windows keep upstream; Linux replaces it later)
  *     rg|rg.exe           ripgrep binary (kept from upstream)
  *     plugins/            Bundled plugins
  *     native/             Platform native modules

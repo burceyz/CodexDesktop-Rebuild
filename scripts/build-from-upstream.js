@@ -4,8 +4,8 @@
  *
  * For macOS and Windows: no forge needed.
  * Takes the upstream app, patches ASAR in-place, and outputs distributable.
- * Windows keeps the upstream codex.exe so the app-server protocol stays aligned
- * with the bundled cua_node/node_repl binaries from the same MSIX.
+ * macOS and Windows keep the upstream Codex CLI so the app-server protocol stays
+ * aligned with the bundled code-mode host and local tool runtimes.
  *
  * Usage:
  *   node scripts/build-from-upstream.js --platform mac-arm64
@@ -15,6 +15,7 @@
 const fs = require("fs");
 const path = require("path");
 const { execSync, execFileSync } = require("child_process");
+const { getCodexBinarySource } = require("./codex-binary-policy");
 const { validateWindowsPackage } = require("./sync-upstream");
 
 const PROJECT_ROOT = path.resolve(__dirname, "..");
@@ -23,12 +24,6 @@ const SRC_DIR = path.join(PROJECT_ROOT, "src");
 const OUT_DIR = process.env.CODEX_OUT_DIR
   ? path.resolve(PROJECT_ROOT, process.env.CODEX_OUT_DIR)
   : path.join(PROJECT_ROOT, "out");
-
-const TARGET_TRIPLE_MAP = {
-  "mac-arm64": "aarch64-apple-darwin",
-  "mac-x64": "x86_64-apple-darwin",
-  "win": "x86_64-pc-windows-msvc",
-};
 
 // ─── Helpers ────────────────────────────────────────────────────
 
@@ -159,57 +154,6 @@ function createDmg(sourceDir, dmgPath, options = {}) {
   }
 }
 
-function resolveCodexVendor(platform) {
-  const triple = TARGET_TRIPLE_MAP[platform];
-  if (!triple) return null;
-  const binName = platform === "win" ? "codex.exe" : "codex";
-
-  // Try platform-specific package (0.128+)
-  const PKG_MAP = { "mac-arm64": "codex-darwin-arm64", "mac-x64": "codex-darwin-x64", "win": "codex-win32-x64" };
-  const platPkg = PKG_MAP[platform];
-  if (platPkg) {
-    const p = path.join(PROJECT_ROOT, "node_modules", "@cometix", platPkg, "vendor", triple, "codex", binName);
-    if (fs.existsSync(p)) return p;
-  }
-  // Try old-style vendor (pre-0.128)
-  const localPath = path.join(PROJECT_ROOT, "node_modules", "@cometix", "codex", "vendor", triple, "codex", binName);
-  if (fs.existsSync(localPath)) return localPath;
-
-  // npm pack fallback — fetch platform-specific package
-  // First get latest cometix base version, then append platform suffix
-  const PLAT_SUFFIX = {
-    "mac-arm64": "darwin-arm64", "mac-x64": "darwin-x64",
-    "win": "win32-x64",
-    "linux-x64": "linux-x64", "linux-arm64": "linux-arm64",
-  };
-  const suffix = PLAT_SUFFIX[platform];
-  if (!suffix) return null;
-
-  let baseVer;
-  try {
-    baseVer = execSync("npm view @cometix/codex version", { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
-  } catch { return null; }
-
-  // e.g. "0.128.0-cometix" → "@cometix/codex@0.128.0-cometix-darwin-x64"
-  const platPkgSpec = `@cometix/codex@${baseVer}-${suffix}`;
-  console.log(`   [codex] fetching ${platPkgSpec} via npm pack...`);
-  const tmpDir = path.join(require("os").tmpdir(), "cometix-codex-pack");
-  fs.mkdirSync(tmpDir, { recursive: true });
-  try {
-    const tgzName = execSync(`npm pack ${platPkgSpec} --pack-destination "${tmpDir}"`, {
-      cwd: tmpDir, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"],
-    }).trim().split("\n").pop();
-    const extractDir = path.join(tmpDir, "extracted");
-    clearDir(extractDir);
-    execSync(`tar xzf "${path.join(tmpDir, tgzName)}" -C "${extractDir}"`, { stdio: "pipe" });
-    const p = path.join(extractDir, "package", "vendor", triple, "codex", binName);
-    if (fs.existsSync(p)) return p;
-  } catch (e) {
-    console.log(`   [!] npm pack failed: ${e.message}`);
-  }
-  return null;
-}
-
 // ─── macOS build ────────────────────────────────────────────────
 
 function buildMac(platform) {
@@ -267,8 +211,8 @@ function buildMac(platform) {
   try { execSync(`codesign --remove-signature "${outApp}"`, { stdio: "pipe" }); } catch {}
   try { execSync(`xattr -rd com.apple.quarantine "${outApp}"`, { stdio: "pipe" }); } catch {}
 
-  // 6. Replace codex CLI
-  replaceCodex(platform, resourcesDir, "codex");
+  // 6. 保留与当前桌面端及 code-mode host 同包发布的 CLI，避免 IPC 协议漂移。
+  keepUpstreamCodex(platform, resourcesDir, "codex");
 
   // 7. Ad-hoc re-sign (prevents "damaged app" Gatekeeper error)
   console.log("   [codesign] ad-hoc signing");
@@ -350,10 +294,7 @@ function buildWin(platform) {
     patchWindowsAsarIntegrity(outApp, oldHash, newHash);
   }
 
-  // Keep the upstream Windows codex.exe. The Desktop app-server and
-  // cua_node/node_repl exchange Codex-specific MCP metadata; replacing only the
-  // CLI with @cometix/codex can make that protocol drift and break browser
-  // tools (for example: sandboxCwd must use the file URI scheme).
+  // 保留上游 Windows CLI，使 app-server、code-mode host 与本地工具运行时版本一致。
   keepUpstreamCodex(platform, resourcesDir, "codex.exe");
 
   // Create ZIP
@@ -429,25 +370,16 @@ function updateAsarIntegrity(asarPath, infoPlistPath) {
 
 // ─── Shared ─────────────────────────────────────────────────────
 
-function replaceCodex(platform, resourcesDir, binName) {
-  const vendor = resolveCodexVendor(platform);
-  if (vendor) {
-    const dest = path.join(resourcesDir, binName);
-    fs.copyFileSync(vendor, dest);
-    try { fs.chmodSync(dest, 0o755); } catch {}
-    console.log(`   [codex] replaced with @cometix/codex`);
-  } else {
-    console.log(`   [!] @cometix/codex not found, keeping upstream codex`);
-  }
-}
-
 function keepUpstreamCodex(platform, resourcesDir, binName) {
+  if (getCodexBinarySource(platform) !== "upstream") {
+    throw new Error(`Direct upstream packaging cannot use a replacement CLI for ${platform}`);
+  }
   const codexPath = path.join(resourcesDir, binName);
   if (!fs.existsSync(codexPath)) {
-    console.log(`   [!] upstream ${binName} not found for ${platform}`);
-    return;
+    throw new Error(`Upstream ${binName} not found for ${platform}`);
   }
   console.log(`   [codex] keeping upstream ${binName}`);
+  return codexPath;
 }
 
 function createZip(zipPath, cwd) {
@@ -535,6 +467,7 @@ module.exports = {
   createDmg,
   isOwlRuntime,
   isRetryableHdiutilError,
+  keepUpstreamCodex,
   patchExeHash,
   patchWindowsAsarIntegrity,
 };

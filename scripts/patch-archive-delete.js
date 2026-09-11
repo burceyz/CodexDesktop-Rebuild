@@ -9,7 +9,7 @@
  * The delete button calls the app-server "thread/delete" protocol via the
  * message router, which permanently removes the thread (DB + rollout file).
  *
- * Requires @cometix/codex CLI with thread/delete support.
+ * 回退注入要求最终打包的 CLI 支持 thread/delete。
  * 26.803 起上游已提供单条、按项目及全部删除；检测到完整原生链路时不再注入。
  */
 const fs = require("fs");

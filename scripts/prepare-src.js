@@ -1,15 +1,15 @@
 #!/usr/bin/env node
 /**
- * Pre-build: Repack patched ASAR, replace codex CLI where needed, assemble for forge.
+ * Pre-build: Repack patched ASAR, select the compatible Codex CLI, assemble for forge.
  *
  * Flow:
  *   1. Repack _asar/ -> app.asar (with patches applied)
- *   2. Replace codex binary with @cometix/codex version where needed
+ *   2. Keep the bundled CLI on desktop platforms; replace it for Linux
  *   3. Copy everything to src/ for forge (app.asar + unpacked + resources)
  *
- * For Windows: keep upstream codex.exe so app-server and cua_node/node_repl
- * stay protocol-aligned.
- * For Linux: strip macOS-only resources, add Linux codex from @cometix/codex
+ * For macOS and Windows: keep the bundled CLI so app-server, code-mode host,
+ * and local tool runtimes stay protocol-aligned.
+ * For Linux: strip macOS-only resources and add Linux codex from @cometix/codex.
  *
  * Usage:
  *   node scripts/prepare-src.js --platform mac-arm64
@@ -18,6 +18,7 @@
 const fs = require("fs");
 const path = require("path");
 const { execSync, execFileSync } = require("child_process");
+const { getCodexBinarySource } = require("./codex-binary-policy");
 
 const SRC = path.join(__dirname, "..", "src");
 const PROJECT_ROOT = path.join(__dirname, "..");
@@ -227,25 +228,27 @@ function main() {
   const asarSize = (fs.statSync(repackedAsar).size / 1048576).toFixed(1);
   console.log(`   [ok] app.asar: ${asarSize} MB`);
 
-  // 2. Replace codex binary with @cometix/codex where needed.
-  // Windows must keep the upstream codex.exe from the MSIX. The Desktop
-  // app-server and bundled cua_node/node_repl exchange Codex-specific MCP
-  // metadata; mixing a different @cometix/codex build can break browser tools
-  // (for example: sandboxCwd must use the file URI scheme).
+  // 2. 桌面平台保留同包 CLI；只有 Linux 需要替换为可执行的原生二进制。
   const isWin = platform === "win";
   const codexBinName = isWin ? "codex.exe" : "codex";
-  const vendorCodex = isWin ? null : resolveCodexVendor(platform);
-  if (isWin) {
+  const binarySource = getCodexBinarySource(platform);
+  const vendorCodex = binarySource === "cometix" ? resolveCodexVendor(platform) : null;
+  if (binarySource === "upstream") {
+    const upstreamCodex = path.join(sourceDir, codexBinName);
+    if (!fs.existsSync(upstreamCodex)) {
+      console.error(`[x] Upstream ${codexBinName} not found for ${platform}`);
+      process.exit(1);
+    }
     console.log(`   [codex] keeping upstream ${codexBinName}`);
   } else if (vendorCodex) {
-    // For Linux: put codex in sourceDir (mac-x64/) so it can be found,
-    // but also mark for later copy to forge output.
+    // Linux 复用 macOS 应用资源，因此必须换成目标架构可执行文件。
     const dest = path.join(sourceDir, codexBinName);
     fs.copyFileSync(vendorCodex, dest);
     try { fs.chmodSync(dest, 0o755); } catch {}
     console.log(`   [codex] replaced with @cometix/codex`);
   } else {
-    console.log(`   [!] @cometix/codex vendor not found for ${platform}, keeping upstream`);
+    console.error(`[x] @cometix/codex vendor not found for ${platform}`);
+    process.exit(1);
   }
 
   // 2b. For Linux: replace rg with platform-native version from @cometix/codex

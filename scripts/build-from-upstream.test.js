@@ -7,8 +7,10 @@ const path = require("node:path");
 const {
   createDmg,
   isRetryableHdiutilError,
+  keepUpstreamCodex,
   patchWindowsAsarIntegrity,
 } = require("./build-from-upstream");
+const { getCodexBinarySource } = require("./codex-binary-policy");
 
 function createTemporaryOutput(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "codex-dmg-test-"));
@@ -93,4 +95,29 @@ test("Windows Owl runtime 修补 ChatGPT.exe 中的 ASAR 哈希", (t) => {
   assert.equal(patchWindowsAsarIntegrity(directory, oldHash, newHash), chatGptExe);
   assert.equal(fs.readFileSync(chatGptExe, "utf8"), `prefix:${newHash}:suffix`);
   assert.equal(fs.readFileSync(codexExe, "utf8"), "launcher-without-integrity-hash");
+});
+
+test("macOS 和 Windows 保留上游 CLI，Linux 使用平台替换包", () => {
+  assert.equal(getCodexBinarySource("mac-arm64"), "upstream");
+  assert.equal(getCodexBinarySource("mac-x64"), "upstream");
+  assert.equal(getCodexBinarySource("win"), "upstream");
+  assert.equal(getCodexBinarySource("linux-x64"), "cometix");
+  assert.equal(getCodexBinarySource("linux-arm64"), "cometix");
+  assert.throws(() => getCodexBinarySource("freebsd-x64"), /Unsupported Codex binary platform/);
+});
+
+test("保留上游 CLI 时不会改写二进制", (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cli-policy-test-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+
+  const codexPath = path.join(directory, "codex");
+  const original = Buffer.from("upstream-cli-same-release");
+  fs.writeFileSync(codexPath, original);
+
+  assert.equal(keepUpstreamCodex("mac-arm64", directory, "codex"), codexPath);
+  assert.deepEqual(fs.readFileSync(codexPath), original);
+  assert.throws(
+    () => keepUpstreamCodex("linux-x64", directory, "codex"),
+    /cannot use a replacement CLI/,
+  );
 });

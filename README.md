@@ -62,7 +62,7 @@ GitHub Actions automatically builds on:
 **© OpenAI · Cometix Space**
 
 - [OpenAI Codex](https://github.com/openai/codex) - Original Codex CLI (Apache-2.0)
-- [Cometix Space](https://github.com/Haleclipse) - Cross-platform rebuild & [@cometix/codex](https://www.npmjs.com/package/@cometix/codex) binaries
+- [Cometix Space](https://github.com/Haleclipse) - Cross-platform rebuild & Linux [@cometix/codex](https://www.npmjs.com/package/@cometix/codex) binaries
 - [Electron Forge](https://www.electronforge.io/) - Build toolchain
 
 ## License
