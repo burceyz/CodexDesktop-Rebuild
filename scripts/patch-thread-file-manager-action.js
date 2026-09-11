@@ -3,10 +3,10 @@
  * 将对话右键菜单的系统文件管理器入口提升到顶层。
  *
  * 26.825 起，上游把工作区的所有打开目标统一收进“打开方式”子菜单；
- * 26.901 又把侧边栏会话菜单拆到 app-primary，并仅为 Git 会话调用该菜单。
- * 本补丁先复用打开链路增加顶层入口，再放宽侧边栏的 Git 限制，使所有
- * 有工作目录的本地会话都能显示入口。旧版若已提供 open-thread-folder，
- * 则安全跳过。
+ * 26.901 又把侧边栏会话菜单拆到 app-primary，并仅为 Git 会话调用该菜单；
+ * 26.908 将该限制移入派生选择器。本补丁先复用打开链路增加顶层入口，
+ * 再放宽两种结构中的 Git 限制，使所有有工作目录的本地会话都能显示入口。
+ * 旧版若已提供 open-thread-folder，则安全跳过。
  *
  * Usage:
  *   node scripts/patch-thread-file-manager-action.js [platform]
@@ -30,7 +30,6 @@ const SIDEBAR_PATCHABLE_SIGNATURES = [
   "id:`rename-thread`",
   "id:`archive-thread`",
   "id:`open-in-new-window`",
-  "remote_control_connections",
 ];
 
 function walk(node, visitor) {
@@ -234,7 +233,65 @@ function findPatchContext(ast, source) {
 }
 
 function findSidebarPatchContexts(ast, source) {
+  const selectorGitGates = new Map();
   const contexts = [];
+
+  // 26.908 起，Git 仓库限制位于派生选择器中，而不是菜单 push 表达式中。
+  walkWithAncestors(ast, (node, ancestors) => {
+    if (node.type !== "ArrowFunctionExpression") return;
+
+    const call = ancestors.at(-1);
+    const owner = ancestors.at(-2);
+    if (call?.type !== "CallExpression" || !call.arguments.includes(node)) return;
+
+    const selectorName =
+      owner?.type === "AssignmentExpression" &&
+      owner.right === call &&
+      owner.left?.type === "Identifier"
+        ? owner.left.name
+        : owner?.type === "VariableDeclarator" &&
+            owner.init === call &&
+            owner.id?.type === "Identifier"
+          ? owner.id.name
+          : null;
+    if (selectorName == null) return;
+
+    const targetBindings = objectPatternBindings(node.params[0]);
+    const stateBindings = objectPatternBindings(node.params[1]);
+    const conversationId = targetBindings.get("conversationId");
+    const hostId = targetBindings.get("hostId");
+    const get = stateBindings.get("get");
+    const code = source.slice(node.start, node.end);
+    if (
+      conversationId == null ||
+      hostId == null ||
+      get == null ||
+      !code.includes("remote_control_connections")
+    ) {
+      return;
+    }
+
+    const gitGates = [];
+    walk(node.body, (candidate) => {
+      if (
+        candidate.type === "CallExpression" &&
+        candidate.callee?.type === "Identifier" &&
+        candidate.callee.name === get &&
+        candidate.arguments[0]?.type === "Identifier" &&
+        candidate.arguments.some(
+          (argument) =>
+            argument.type === "Identifier" &&
+            argument.name === conversationId,
+        )
+      ) {
+        gitGates.push(candidate);
+      }
+    });
+
+    if (gitGates.length === 1) {
+      selectorGitGates.set(selectorName, gitGates[0]);
+    }
+  });
 
   walk(ast, (functionNode) => {
     if (
@@ -292,24 +349,55 @@ function findSidebarPatchContexts(ast, source) {
       }
 
       const gitGate = logical.left.right;
+      const isScopeGetCall =
+        gitGate?.type === "CallExpression" &&
+        gitGate.callee?.type === "MemberExpression" &&
+        memberName(gitGate.callee) === "get" &&
+        gitGate.callee.object?.type === "Identifier" &&
+        gitGate.callee.object.name === scope;
+      const isInlineGitGate =
+        isScopeGetCall &&
+        gitGate.arguments.some(
+          (argument) =>
+            argument.type === "Identifier" && argument.name === conversationId,
+        );
+
+      if (isInlineGitGate) {
+        contexts.push({
+          kind: "inline",
+          logical,
+          preservedCondition: logical.left.left,
+          pushCall,
+        });
+        return;
+      }
+
       if (
         gitGate?.type !== "CallExpression" ||
         gitGate.callee?.type !== "MemberExpression" ||
         memberName(gitGate.callee) !== "get" ||
         gitGate.callee.object?.type !== "Identifier" ||
         gitGate.callee.object.name !== scope ||
-        !gitGate.arguments.some(
-          (argument) =>
-            argument.type === "Identifier" && argument.name === conversationId,
-        )
+        gitGate.arguments[0]?.type !== "Identifier"
+      ) {
+        return;
+      }
+
+      const selectorGitGate = selectorGitGates.get(gitGate.arguments[0].name);
+      const selectorTarget = objectExpressionProperties(gitGate.arguments[1]);
+      if (
+        selectorGitGate == null ||
+        selectorTarget.get("conversationId")?.type !== "Identifier" ||
+        selectorTarget.get("conversationId").name !== conversationId ||
+        selectorTarget.get("hostId")?.type !== "Identifier" ||
+        selectorTarget.get("hostId").name !== hostId
       ) {
         return;
       }
 
       contexts.push({
-        logical,
-        preservedCondition: logical.left.left,
-        pushCall,
+        kind: "selector",
+        selectorGitGate,
       });
     });
   });
@@ -459,13 +547,23 @@ function patchSidebarSource(source) {
     };
   }
 
-  const [{ logical, preservedCondition, pushCall }] = contexts;
-  const replacement =
-    source.slice(preservedCondition.start, preservedCondition.end) +
-    `&&${SIDEBAR_MARKER}` +
-    source.slice(pushCall.start, pushCall.end);
-  const next =
-    source.slice(0, logical.start) + replacement + source.slice(logical.end);
+  const [context] = contexts;
+  let next;
+  if (context.kind === "selector") {
+    const { selectorGitGate } = context;
+    next =
+      source.slice(0, selectorGitGate.start) +
+      `!0${SIDEBAR_MARKER}` +
+      source.slice(selectorGitGate.end);
+  } else {
+    const { logical, preservedCondition, pushCall } = context;
+    const replacement =
+      source.slice(preservedCondition.start, preservedCondition.end) +
+      `&&${SIDEBAR_MARKER}` +
+      source.slice(pushCall.start, pushCall.end);
+    next =
+      source.slice(0, logical.start) + replacement + source.slice(logical.end);
+  }
 
   try {
     parse(next);

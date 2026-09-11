@@ -87,13 +87,36 @@ function createSidebarMenuBundle() {
   ].join("");
 }
 
+function createSelectorSidebarMenuBundle() {
+  return [
+    "let sidebarGate=derive(store,({conversationId:id,hostId:h},{get:g})=>",
+    "id!=null&&g(gitBacked,id)&&!getState(g,`remote_control_connections`)",
+    "?.some(item=>item.hostId===h));",
+    "function buildThreadMenu({scope:s,target:t}){",
+    "let{conversationId:id,hostId:h,cwd:c}=t,items=[];",
+    "let primary=[{id:`rename-thread`},{id:`archive-thread`}];",
+    "return c!=null&&s.get(sidebarGate,{conversationId:id,hostId:h})",
+    "&&items.push(...buildOpenItems({scope:s,cwd:normalize(c),hostId:h})),",
+    "items.push({id:`open-in-new-window`}),",
+    "[...primary,...items]",
+    "}",
+  ].join("");
+}
+
 function evaluatePatchedSidebar(source, options = {}) {
   const context = {
     gitBacked: {},
     getState: () => options.remoteConnections ?? [],
+    derive: (_store, selector) => selector,
+    store: {},
     normalize: (cwd) => cwd,
     buildOpenItems: () => [{ id: DIRECT_ACTION_ID }],
-    scope: { get: () => false },
+    scope: {
+      get: (value, argument) =>
+        typeof value === "function"
+          ? value(argument, { get: () => false })
+          : false,
+    },
   };
   vm.runInNewContext(
     `${source};result=buildThreadMenu({scope,target:{` +
@@ -170,6 +193,26 @@ test("侧边栏入口仍要求工作目录且排除远程控制连接", () => {
   );
   assert.equal(
     evaluatePatchedSidebar(source, {
+      remoteConnections: [{ hostId: "local" }],
+    }).some((item) => item.id === DIRECT_ACTION_ID),
+    false,
+  );
+});
+
+test("兼容 26.908 将 Git 限制移入派生选择器的结构", () => {
+  const result = patchSidebarSource(createSelectorSidebarMenuBundle());
+
+  assert.equal(result.status, "patched");
+  assert.ok(result.source.includes(`!0${SIDEBAR_MARKER}`));
+  assert.doesNotMatch(result.source, /g\(gitBacked,id\)/);
+  assert.equal(
+    evaluatePatchedSidebar(result.source).some(
+      (item) => item.id === DIRECT_ACTION_ID,
+    ),
+    true,
+  );
+  assert.equal(
+    evaluatePatchedSidebar(result.source, {
       remoteConnections: [{ hostId: "local" }],
     }).some((item) => item.id === DIRECT_ACTION_ID),
     false,
