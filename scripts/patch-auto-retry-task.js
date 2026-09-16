@@ -1,24 +1,17 @@
 #!/usr/bin/env node
 /**
- * patch-auto-retry-task.js — 任务失败后自动发送“继续未完成的工作”进行新一轮重试
+ * patch-auto-retry-task.js — 任务失败后自动发送“继续未完成的工作”进行新一轮重试（支持前后台会话）
  *
  * 背景：
  * 当 Codex 轮次遭遇官方服务容量瓶颈（如“We're currently experiencing high demand...”）并在 5 次重试均失败后，
- * 轮次状态变为 failed。官方客户端原生自带倒计时重试组件（A3n/j3n），但存在以下阻断：
- * 1. 错误卡片入口门禁：D3n 组件仅对 a.errorInfo === 'serverOverloaded' 调用 A3n，而实际高负载或流断开时
- *    服务端下发的 errorInfo 往往为 null 或未定义，导致直接回退为无重试按钮的普通错误卡片。
- * 2. 线程状态门禁：A3n 中检查了 l === 'ready'，若流断开后状态未完全转为 ready 会被拦截。
- * 3. 延迟与 Gate 门禁：j3n 中受 Gate 2899820207 限制，且服务端未下发 retryDelaySeconds。
- * 4. 用户角色门禁：j3n 中硬编码了 s?.role === 'owner'。
+ * 轮次状态变为 failed。
  *
- * 修复与增强：
- * 1. 放宽错误卡片门禁：除账号额度耗尽（usageLimitExceeded）外，其余所有附带 turnId 的轮次失败错误卡片均进入 A3n 重试体系。
- * 2. 移除冗余 ready 校验：轮次只要为 failed 且为当前最新轮次，即激活重试倒计时。
- * 3. 缩减重试等待时长：延迟缩减设置为 3 秒（实现更快速的自动续跑）。
- * 4. 激活官方原生重试组件：强制绕过 Gate 2899820207，放宽角色限制（s?.role !== 'follower'）。
- * 5. 注入自动接续消息：倒计时归零时自动通过 startEmptyTurn 发送：
- *    continuationInput: [{ type: "text", text: "继续未完成的工作", text_elements: [] }]
- * 6. 防死循环熔断保护：5 分钟内最多允许自动连续重试 3 轮，达到上限后停止自动倒计时，保留手动重试按钮。
+ * 两层架构支持：
+ * 1. 【UI 层 / app-primary】：在前台打开的对话中，展示 3 秒倒计时与动态进度条按钮，倒计时归零自动触发，
+ *    并提供手动点击重试入口（清零计数器）。
+ * 2. 【服务层 / app-initial】：在核心消息事件系统（turn/completed）中，不论用户当前停留在哪个对话、
+ *    或者已切换至其他对话乃至最小化窗口，只要后台任意会话失败且队列中无用户待发送消息，
+ *    自动在 3 秒退避后调用 `startEmptyTurn` 发送“继续未完成的工作”，确保无人值守挂机可靠执行。
  *
  * Usage:
  *   node scripts/patch-auto-retry-task.js [platform]   # mac-arm64 | mac-x64 | win | 省略=全部
@@ -36,7 +29,10 @@ function parseCode(code) {
   }
 }
 
-function patchSource(source) {
+/**
+ * 补丁 1：UI 前台层（app-primary）
+ */
+function patchPrimarySource(source) {
   if (
     source.includes(".errorInfo!=`usageLimitExceeded`&&") &&
     source.includes("retryDelaySeconds:_rds") &&
@@ -114,7 +110,6 @@ function patchSource(source) {
     modified = true;
   }
 
-  // 获取 conversationId 变量名以便传给计数器
   const convMatch = patched.match(
     /\{conversationId:([a-zA-Z0-9_$]+),hostId:[a-zA-Z0-9_$]+,retryDelaySeconds:_rds\}/,
   );
@@ -166,16 +161,46 @@ function patchSource(source) {
   }
 
   if (!modified) {
-    // 检查是否所有要点都已经就绪
-    if (
-      patched.includes(".errorInfo!=`usageLimitExceeded`&&") &&
-      patched.includes("continuationInput") &&
-      patched.includes("globalThis.__codexAutoRetries")
-    ) {
-      return { status: "already-patched", source: patched };
-    }
-    return { status: "not-found", source: patched };
+    return { status: "already-patched", source: patched };
   }
+
+  try {
+    parseCode(patched);
+  } catch (error) {
+    return { status: "parse-failed", error, source };
+  }
+
+  return { status: "patched", source: patched };
+}
+
+/**
+ * 补丁 2：服务后台层（app-initial）
+ * 监听全局 turn/completed 事件，对话在后台切出时也能自动继续
+ */
+function patchInitialSource(source) {
+  if (
+    source.includes("globalThis.__codexAutoRetries") &&
+    source.includes("capacity_retry_automatic")
+  ) {
+    return { status: "already-patched", source };
+  }
+
+  const regex =
+    /(hasRunnableQueuedFollowUp:([a-zA-Z0-9_$]+)\}[\s\S]*?\.getStreamRole\(([a-zA-Z0-9_$]+)\)\?\.role!==`follower`&&)([a-zA-Z0-9_$]+)\.events\.emitTurnCompleted\(\{conversationId:\3,hostId:([a-zA-Z0-9_$]+)\.getHostId\(\),status:([a-zA-Z0-9_$]+)\.status/;
+  const match = source.match(regex);
+  if (!match) {
+    return { status: "not-found", source };
+  }
+
+  const [fullMatch, prefix, hasQueueVar, convVar, eventsVar, mgrVar, turnVar] =
+    match;
+
+  const injection = `(${turnVar}.status===\`failed\`&&!${hasQueueVar}&&setTimeout(async()=>{try{globalThis.__codexAutoRetries=globalThis.__codexAutoRetries||new Map();let _ar=globalThis.__codexAutoRetries.get(${convVar})||{count:0,time:0};if(Date.now()-_ar.time>3e5)_ar={count:0,time:Date.now()};if(_ar.count<3){_ar.count++;_ar.time=Date.now();globalThis.__codexAutoRetries.set(${convVar},_ar);await ${mgrVar}.startEmptyTurn(${convVar},{turnTrigger:\`capacity_retry_automatic\`,continuationInput:[{type:\`text\`,text:\`继续未完成的工作\`,text_elements:[]}]})}}catch(e){}},3e3)),`;
+
+  const patched = source.replace(
+    fullMatch,
+    `${prefix}${injection}${eventsVar}.events.emitTurnCompleted({conversationId:${convVar},hostId:${mgrVar}.getHostId(),status:${turnVar}.status`,
+  );
 
   try {
     parseCode(patched);
@@ -193,48 +218,90 @@ function main() {
     ["mac-arm64", "mac-x64", "win"].includes(a),
   );
 
-  const bundles = locateBundles({
+  let patched = 0;
+  let failed = 0;
+
+  // 1. 打 UI 层（app-primary）
+  const primaryBundles = locateBundles({
     dir: "assets",
     pattern: /^app-primary-.*\.js$/,
     platform,
   });
 
-  if (bundles.length === 0) {
-    console.log("  [skip] app-primary bundle not found");
-    return;
-  }
-
-  let patched = 0;
-  let failed = 0;
-
-  for (const bundle of bundles) {
+  for (const bundle of primaryBundles) {
     const code = fs.readFileSync(bundle.path, "utf-8");
-    const result = patchSource(code);
+    const result = patchPrimarySource(code);
     const label = relPath(bundle.path);
 
     if (result.status === "already-patched") {
-      console.log(`  [ok] ${label}: already patched`);
+      console.log(`  [ok] ${label}: already patched (UI layer)`);
       continue;
     }
     if (result.status === "not-found") {
-      console.log(`  [x] ${label}: auto-retry anchors not found`);
+      console.log(`  [x] ${label}: auto-retry anchors not found (UI layer)`);
       failed++;
       continue;
     }
     if (result.status === "parse-failed") {
-      console.log(`  [x] ${label}: parse failed: ${result.error.message}`);
+      console.log(
+        `  [x] ${label}: parse failed (UI layer): ${result.error.message}`,
+      );
       failed++;
       continue;
     }
 
     if (isCheck) {
-      console.log(`  [dry-run] ${label}: would patch auto-retry task policy`);
+      console.log(`  [dry-run] ${label}: would patch auto-retry UI policy`);
       patched++;
       continue;
     }
 
     fs.writeFileSync(bundle.path, result.source, "utf-8");
-    console.log(`  [ok] ${label}: patched auto-retry task policy`);
+    console.log(`  [ok] ${label}: patched auto-retry UI policy`);
+    patched++;
+  }
+
+  // 2. 打后台服务层（app-initial）
+  const initialBundles = locateBundles({
+    dir: "assets",
+    pattern: /^app-initial-.*\.js$/,
+    platform,
+  });
+
+  for (const bundle of initialBundles) {
+    const code = fs.readFileSync(bundle.path, "utf-8");
+    const result = patchInitialSource(code);
+    const label = relPath(bundle.path);
+
+    if (result.status === "already-patched") {
+      console.log(`  [ok] ${label}: already patched (Background service layer)`);
+      continue;
+    }
+    if (result.status === "not-found") {
+      console.log(
+        `  [x] ${label}: turn/completed anchor not found (Background service layer)`,
+      );
+      failed++;
+      continue;
+    }
+    if (result.status === "parse-failed") {
+      console.log(
+        `  [x] ${label}: parse failed (Background service layer): ${result.error.message}`,
+      );
+      failed++;
+      continue;
+    }
+
+    if (isCheck) {
+      console.log(
+        `  [dry-run] ${label}: would patch background auto-retry service`,
+      );
+      patched++;
+      continue;
+    }
+
+    fs.writeFileSync(bundle.path, result.source, "utf-8");
+    console.log(`  [ok] ${label}: patched background auto-retry service`);
     patched++;
   }
 
