@@ -41,7 +41,8 @@ function patchSource(source) {
     source.includes(".errorInfo!=`usageLimitExceeded`&&") &&
     source.includes("retryDelaySeconds:_rds") &&
     source.includes("continuationInput") &&
-    source.includes("globalThis.__codexAutoRetries")
+    source.includes("globalThis.__codexAutoRetries") &&
+    !source.includes(".get(qi,{hostId:")
   ) {
     return { status: "already-patched", source };
   }
@@ -67,6 +68,15 @@ function patchSource(source) {
   const a3nMatch = patched.match(a3nRegex);
   if (a3nMatch) {
     patched = patched.replace(a3nMatch[0], `if(${a3nMatch[2]})`);
+    modified = true;
+  }
+
+  // 2.1 移除 g 内部的 qi!=='ready' 检查（使 Mac 版与 Windows 保持一致）
+  const qiInGRegex =
+    /[a-zA-Z0-9_$]+\.get\([a-zA-Z0-9_$]+,\{hostId:[a-zA-Z0-9_$]+,threadId:[a-zA-Z0-9_$]+\}\)!==`ready`\|\|/;
+  const qiInGMatch = patched.match(qiInGRegex);
+  if (qiInGMatch) {
+    patched = patched.replace(qiInGMatch[0], "");
     modified = true;
   }
 
