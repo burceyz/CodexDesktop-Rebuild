@@ -35,6 +35,7 @@ const PATCHES = [
   "patch-sentry-scope.js",
   "patch-cdp-screenshot.js",
   "patch-queue-failure-policy.js",
+  "patch-auto-retry-task.js",
 ];
 
 function main() {
