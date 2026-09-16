@@ -1,29 +1,24 @@
 #!/usr/bin/env node
 /**
- * patch-auto-retry-task.js — 服务过载（429 / serverOverloaded）失败后自动发送“继续未完成的工作”进行新一轮重试
+ * patch-auto-retry-task.js — 任务失败后自动发送“继续未完成的工作”进行新一轮重试
  *
  * 背景：
- * 当 Codex 轮次遭遇官方服务容量瓶颈（serverOverloaded / 429）并在尝试 5 次重连均失败后，
- * 轮次状态变为 failed，并在界面上呈现错误提示卡片。
- * 原生代码中实际上内置了倒计时自动重试组件（j3n / LDr），但因受到 Statsig Gate `2899820207`
- * 以及服务端未返回 `retryDelaySeconds`（导致值为 null）的阻断，自动倒计时从未被激活。
+ * 当 Codex 轮次遭遇官方服务容量瓶颈（如“We're currently experiencing high demand...”）并在 5 次重试均失败后，
+ * 轮次状态变为 failed。官方客户端原生自带倒计时重试组件（A3n/j3n），但存在以下阻断：
+ * 1. 错误卡片入口门禁：D3n 组件仅对 a.errorInfo === 'serverOverloaded' 调用 A3n，而实际高负载或流断开时
+ *    服务端下发的 errorInfo 往往为 null 或未定义，导致直接回退为无重试按钮的普通错误卡片。
+ * 2. 线程状态门禁：A3n 中检查了 l === 'ready'，若流断开后状态未完全转为 ready 会被拦截。
+ * 3. 延迟与 Gate 门禁：j3n 中受 Gate 2899820207 限制，且服务端未下发 retryDelaySeconds。
+ * 4. 用户角色门禁：j3n 中硬编码了 s?.role === 'owner'。
  *
  * 修复与增强：
- * 1. 默认延迟：当 `retryDelaySeconds` 为 null/undefined 时，默认赋予 5 秒退避倒计时。
- * 2. 激活原生倒计时：绕过 Gate `2899820207`（强制为 true），激活原生进度条倒计时组件（S3n / ODr）。
- * 3. 注入延续提示语：在倒计时结束或手动点击重试派发新轮次时，注入 `continuationInput`：
- *    [{ type: "text", text: "继续未完成的工作", text_elements: [] }]
- *    使模型无缝接续上文未完成的任务。
- * 4. 防死循环熔断机制：在自动重试触发时，通过全局状态检查当前会话的连续自动重试次数。
- *    若在 5 分钟内连续自动重试达到 3 次，将停止自动倒计时（转为静态重试按钮），防止服务宕机或欠费导致的无限死循环；
- *    用户手动点击重试时将重置连续计数。
- *
- * 锚点：
- * 1. 门禁：`o=X(cC,'2899820207')`
- * 2. 参数解构：`{conversationId:n,hostId:r,retryDelaySeconds:i}=e`
- * 3. 调度函数：`ife(a,r,n,{turnTrigger:e,collaborationMode:c})`
- * 4. 自动触发：`if(e===0){_('capacity_retry_automatic');return}f(e)`
- * 5. 手动触发：`b=()=>_('capacity_retry_manual')`
+ * 1. 放宽错误卡片门禁：除账号额度耗尽（usageLimitExceeded）外，其余所有附带 turnId 的轮次失败错误卡片均进入 A3n 重试体系。
+ * 2. 移除冗余 ready 校验：轮次只要为 failed 且为当前最新轮次，即激活重试倒计时。
+ * 3. 缩减重试等待时长：延迟缩减设置为 3 秒（实现更快速的自动续跑）。
+ * 4. 激活官方原生重试组件：强制绕过 Gate 2899820207，放宽角色限制（s?.role !== 'follower'）。
+ * 5. 注入自动接续消息：倒计时归零时自动通过 startEmptyTurn 发送：
+ *    continuationInput: [{ type: "text", text: "继续未完成的工作", text_elements: [] }]
+ * 6. 防死循环熔断保护：5 分钟内最多允许自动连续重试 3 轮，达到上限后停止自动倒计时，保留手动重试按钮。
  *
  * Usage:
  *   node scripts/patch-auto-retry-task.js [platform]   # mac-arm64 | mac-x64 | win | 省略=全部
@@ -32,21 +27,6 @@
 const fs = require("fs");
 const acorn = require("acorn");
 const { locateBundles, relPath } = require("./patch-util");
-
-const GATE_REGEX =
-  /([a-zA-Z0-9_$]+)=([a-zA-Z0-9_$]+)\(([a-zA-Z0-9_$]+),[`'"]2899820207[`'"]\)/;
-
-const DESTR_REGEX =
-  /\{conversationId:([a-zA-Z0-9_$]+),hostId:([a-zA-Z0-9_$]+),retryDelaySeconds:([a-zA-Z0-9_$]+)\}=([a-zA-Z0-9_$]+)/;
-
-const DISPATCH_REGEX =
-  /([a-zA-Z0-9_$]+)\(([a-zA-Z0-9_$]+),([a-zA-Z0-9_$]+),([a-zA-Z0-9_$]+),\{turnTrigger:([a-zA-Z0-9_$]+),collaborationMode:([a-zA-Z0-9_$]+)\}\)/;
-
-const AUTO_RETRY_REGEX =
-  /if\(([a-zA-Z0-9_$]+)===0\)\{([a-zA-Z0-9_$]+)\([`'"]capacity_retry_automatic[`'"]\);return\}([a-zA-Z0-9_$]+)\(\1\)/;
-
-const MANUAL_RETRY_REGEX =
-  /([a-zA-Z0-9_$]+)=\(\)=>([a-zA-Z0-9_$]+)\([`'"]capacity_retry_manual[`'"]\)/;
 
 function parseCode(code) {
   try {
@@ -58,72 +38,134 @@ function parseCode(code) {
 
 function patchSource(source) {
   if (
-    source.includes("globalThis.__codexAutoRetries") &&
-    source.includes("继续未完成的工作")
+    source.includes(".errorInfo!=`usageLimitExceeded`&&") &&
+    source.includes("retryDelaySeconds:_rds") &&
+    source.includes("continuationInput") &&
+    source.includes("globalThis.__codexAutoRetries")
   ) {
     return { status: "already-patched", source };
   }
 
-  const gateMatch = source.match(GATE_REGEX);
-  const destrMatch = source.match(DESTR_REGEX);
-  const dispatchMatch = source.match(DISPATCH_REGEX);
-  const autoRetryMatch = source.match(AUTO_RETRY_REGEX);
-  const manualRetryMatch = source.match(MANUAL_RETRY_REGEX);
+  let patched = source;
+  let modified = false;
 
-  if (
-    !gateMatch ||
-    !destrMatch ||
-    !dispatchMatch ||
-    !autoRetryMatch ||
-    !manualRetryMatch
-  ) {
-    return {
-      status: "not-found",
-      details: {
-        gateMatch: !!gateMatch,
-        destrMatch: !!destrMatch,
-        dispatchMatch: !!dispatchMatch,
-        autoRetryMatch: !!autoRetryMatch,
-        manualRetryMatch: !!manualRetryMatch,
-      },
-      source,
-    };
+  // 1. 放宽 D3n 错误卡片入口门禁 (对所有非 usageLimitExceeded 的失败轮次卡片激活 A3n)
+  const d3nRegex =
+    /([a-zA-Z0-9_$]+)\.errorInfo===`serverOverloaded`&&([a-zA-Z0-9_$]+)!=null/;
+  const d3nMatch = patched.match(d3nRegex);
+  if (d3nMatch) {
+    patched = patched.replace(
+      d3nMatch[0],
+      `${d3nMatch[1]}.errorInfo!=\`usageLimitExceeded\`&&${d3nMatch[2]}!=null`,
+    );
+    modified = true;
   }
 
-  const [dFull, convVar, hostVar, rdsVar, paramVar] = destrMatch;
-  const [gFull, gVar] = gateMatch;
-  const [dispFull, fnCall, argA, argR, argN, tTrigger, cMode] = dispatchMatch;
-  const [arFull, secVar, fnRetry, fnSetSec] = autoRetryMatch;
-  const [manFull, manVar, manFn] = manualRetryMatch;
+  // 2. 移除 A3n 中可能阻断的 l!=='ready' 检查（Mac 版特有）
+  const a3nRegex =
+    /if\(([a-zA-Z0-9_$]+)!==`ready`\|\|([a-zA-Z0-9_$]+==null\|\|[a-zA-Z0-9_$]+!==[a-zA-Z0-9_$]+\|\|[a-zA-Z0-9_$]+!==`failed`)\)/;
+  const a3nMatch = patched.match(a3nRegex);
+  if (a3nMatch) {
+    patched = patched.replace(a3nMatch[0], `if(${a3nMatch[2]})`);
+    modified = true;
+  }
 
-  let patched = source;
+  // 3. 绕过 Gate 2899820207 门禁
+  const gateRegex =
+    /([a-zA-Z0-9_$]+)=([a-zA-Z0-9_$]+)\(([a-zA-Z0-9_$]+),[`'"]2899820207[`'"]\)/;
+  const gateMatch = patched.match(gateRegex);
+  if (gateMatch) {
+    patched = patched.replace(gateMatch[0], `${gateMatch[1]}=!0`);
+    modified = true;
+  }
 
-  // 1. 默认赋予 5 秒重试倒计时
-  patched = patched.replace(
-    dFull,
-    `{conversationId:${convVar},hostId:${hostVar},retryDelaySeconds:_rds}=${paramVar},${rdsVar}=_rds??5`,
+  // 4. 重试延迟缩减至 3 秒
+  const destrAlreadyRegex =
+    /\{conversationId:([a-zA-Z0-9_$]+),hostId:([a-zA-Z0-9_$]+),retryDelaySeconds:_rds\}=([a-zA-Z0-9_$]+),([a-zA-Z0-9_$]+)=(?:_rds\?\?5|\d+)/;
+  const destrCleanRegex =
+    /\{conversationId:([a-zA-Z0-9_$]+),hostId:([a-zA-Z0-9_$]+),retryDelaySeconds:(?!_rds\b)([a-zA-Z0-9_$]+)\}=([a-zA-Z0-9_$]+)/;
+
+  const mAlready = patched.match(destrAlreadyRegex);
+  const mClean = patched.match(destrCleanRegex);
+
+  if (mAlready) {
+    if (mAlready[4] !== "3") {
+      patched = patched.replace(
+        mAlready[0],
+        `{conversationId:${mAlready[1]},hostId:${mAlready[2]},retryDelaySeconds:_rds}=${mAlready[3]},${mAlready[4]}=3`,
+      );
+      modified = true;
+    }
+  } else if (mClean) {
+    patched = patched.replace(
+      mClean[0],
+      `{conversationId:${mClean[1]},hostId:${mClean[2]},retryDelaySeconds:_rds}=${mClean[4]},${mClean[3]}=3`,
+    );
+    modified = true;
+  }
+
+  // 获取 conversationId 变量名以便传给计数器
+  const convMatch = patched.match(
+    /\{conversationId:([a-zA-Z0-9_$]+),hostId:[a-zA-Z0-9_$]+,retryDelaySeconds:_rds\}/,
   );
+  const convVar = convMatch ? convMatch[1] : "n";
 
-  // 2. 绕过 Gate 门禁，激活原生重试组件
-  patched = patched.replace(gFull, `${gVar}=!0`);
+  // 5. 放宽角色校验：s?.role !== 'follower'
+  const roleRegex = /([a-zA-Z0-9_$]+)\?\.role===`owner`/;
+  const roleMatch = patched.match(roleRegex);
+  if (roleMatch) {
+    patched = patched.replace(roleMatch[0], `${roleMatch[1]}?.role!==\`follower\``);
+    modified = true;
+  }
 
-  // 3. 注入延续指令：“继续未完成的工作”
-  patched = patched.replace(
-    dispFull,
-    `${fnCall}(${argA},${argR},${argN},{turnTrigger:${tTrigger},collaborationMode:${cMode},continuationInput:[{type:\`text\`,text:\`继续未完成的工作\`,text_elements:[]}]})`,
-  );
+  // 6. 注入延续提示语：“继续未完成的工作”
+  const dispatchRegex =
+    /([a-zA-Z0-9_$]+)\(([a-zA-Z0-9_$]+),([a-zA-Z0-9_$]+),([a-zA-Z0-9_$]+),\{turnTrigger:([a-zA-Z0-9_$]+),collaborationMode:([a-zA-Z0-9_$]+)\}\)/;
+  const dispatchMatch = patched.match(dispatchRegex);
+  if (dispatchMatch) {
+    patched = patched.replace(
+      dispatchMatch[0],
+      `${dispatchMatch[1]}(${dispatchMatch[2]},${dispatchMatch[3]},${dispatchMatch[4]},{turnTrigger:${dispatchMatch[5]},collaborationMode:${dispatchMatch[6]},continuationInput:[{type:\`text\`,text:\`继续未完成的工作\`,text_elements:[]}]})`,
+    );
+    modified = true;
+  }
 
-  // 4. 自动倒计时触发时的防死循环连续重试限制（最多 3 轮，5 分钟超时重置）
-  patched = patched.replace(
-    arFull,
-    `if(${secVar}===0){globalThis.__codexAutoRetries=globalThis.__codexAutoRetries||new Map();let _ar=globalThis.__codexAutoRetries.get(${convVar})||{count:0,time:0};if(Date.now()-_ar.time>3e5)_ar={count:0,time:Date.now()};if(_ar.count<3){_ar.count++;_ar.time=Date.now();globalThis.__codexAutoRetries.set(${convVar},_ar);${fnRetry}(\`capacity_retry_automatic\`)}else{${fnSetSec}(null)}return}${fnSetSec}(${secVar})`,
-  );
+  // 7. 自动倒计时触发与防死循环连续重试限制
+  const autoRetryRegex =
+    /if\(([a-zA-Z0-9_$]+)===0\)\{([a-zA-Z0-9_$]+)\([`'"]capacity_retry_automatic[`'"]\);return\}([a-zA-Z0-9_$]+)\(\1\)/;
+  const autoRetryMatch = patched.match(autoRetryRegex);
+  if (autoRetryMatch) {
+    const [arFull, secVar, fnRetry, fnSetSec] = autoRetryMatch;
+    patched = patched.replace(
+      arFull,
+      `if(${secVar}===0){globalThis.__codexAutoRetries=globalThis.__codexAutoRetries||new Map();let _ar=globalThis.__codexAutoRetries.get(${convVar})||{count:0,time:0};if(Date.now()-_ar.time>3e5)_ar={count:0,time:Date.now()};if(_ar.count<3){_ar.count++;_ar.time=Date.now();globalThis.__codexAutoRetries.set(${convVar},_ar);${fnRetry}(\`capacity_retry_automatic\`)}else{${fnSetSec}(null)}return}${fnSetSec}(${secVar})`,
+    );
+    modified = true;
+  }
 
-  // 5. 手动重试时清空连续失败重试计数
-  patched = patched.replace(
-    manFull,
-    `${manVar}=()=>(globalThis.__codexAutoRetries?.delete(${convVar}),${manFn}(\`capacity_retry_manual\`))`,
-  );
+  // 8. 手动重试时重置连续计数
+  const manualRetryRegex =
+    /([a-zA-Z0-9_$]+)=\(\)=>([a-zA-Z0-9_$]+)\([`'"]capacity_retry_manual[`'"]\)/;
+  const manualRetryMatch = patched.match(manualRetryRegex);
+  if (manualRetryMatch) {
+    patched = patched.replace(
+      manualRetryMatch[0],
+      `${manualRetryMatch[1]}=()=>(globalThis.__codexAutoRetries?.delete(${convVar}),${manualRetryMatch[2]}(\`capacity_retry_manual\`))`,
+    );
+    modified = true;
+  }
+
+  if (!modified) {
+    // 检查是否所有要点都已经就绪
+    if (
+      patched.includes(".errorInfo!=`usageLimitExceeded`&&") &&
+      patched.includes("continuationInput") &&
+      patched.includes("globalThis.__codexAutoRetries")
+    ) {
+      return { status: "already-patched", source: patched };
+    }
+    return { status: "not-found", source: patched };
+  }
 
   try {
     parseCode(patched);
@@ -165,9 +207,7 @@ function main() {
       continue;
     }
     if (result.status === "not-found") {
-      console.log(
-        `  [x] ${label}: auto-retry anchors not found: ${JSON.stringify(result.details)}`,
-      );
+      console.log(`  [x] ${label}: auto-retry anchors not found`);
       failed++;
       continue;
     }
