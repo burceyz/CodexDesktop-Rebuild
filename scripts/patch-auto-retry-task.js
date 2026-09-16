@@ -180,27 +180,45 @@ function patchPrimarySource(source) {
 function patchInitialSource(source) {
   if (
     source.includes("globalThis.__codexAutoRetries") &&
-    source.includes("capacity_retry_automatic")
+    source.includes("resumeSource:`executor`")
   ) {
     return { status: "already-patched", source };
   }
 
-  const regex =
-    /(hasRunnableQueuedFollowUp:([a-zA-Z0-9_$]+)\}[\s\S]*?\.getStreamRole\(([a-zA-Z0-9_$]+)\)\?\.role!==`follower`&&)([a-zA-Z0-9_$]+)\.events\.emitTurnCompleted\(\{conversationId:\3,hostId:([a-zA-Z0-9_$]+)\.getHostId\(\),status:([a-zA-Z0-9_$]+)\.status/;
-  const match = source.match(regex);
-  if (!match) {
-    return { status: "not-found", source };
+  let patched = source;
+
+  // 1. 清理旧版本注入（如果存在）
+  const oldInjectionRegex =
+    /[a-zA-Z0-9_$]+\.getStreamRole\([a-zA-Z0-9_$]+\)\?\.role!==`follower`&&\(s\.status===`failed`&&!_&&setTimeout\(async\(\)=>\{[\s\S]*?\},3e3\)\),/g;
+  patched = patched.replace(oldInjectionRegex, "");
+
+  // 2. 增强 startEmptyTurn 支持 resumeSource (Mac 平台)
+  const emptyTurnPattern =
+    /startEmptyTurn\(([a-zA-Z0-9_$]+),([a-zA-Z0-9_$]+)\)\{return ([a-zA-Z0-9_$]+)\(\{conversationId:\1,manager:this,options:\2,resumeConversation:([a-zA-Z0-9_$]+)=>this\.#e\(\4,[`'"]view[`'"]\)/;
+  const mEmpty = patched.match(emptyTurnPattern);
+  if (mEmpty) {
+    patched = patched.replace(
+      mEmpty[0],
+      `startEmptyTurn(${mEmpty[1]},${mEmpty[2]}){return ${mEmpty[3]}({conversationId:${mEmpty[1]},manager:this,options:${mEmpty[2]},resumeConversation:${mEmpty[4]}=>this.#e(${mEmpty[4]},${mEmpty[2]}?.resumeSource??\`view\`)`,
+    );
   }
 
-  const [fullMatch, prefix, hasQueueVar, convVar, eventsVar, mgrVar, turnVar] =
-    match;
+  // 3. 在 turn/completed 事件处理末尾注入可靠的后台自动重试
+  const emitRegex =
+    /([a-zA-Z0-9_$]+)\.events\.emitTurnCompleted\(\{conversationId:([a-zA-Z0-9_$]+),hostId:([a-zA-Z0-9_$]+)\.getHostId\(\),status:([a-zA-Z0-9_$]+)\.status/;
+  const mEmit = patched.match(emitRegex);
+  if (!mEmit) {
+    return { status: "not-found", source: patched };
+  }
 
-  const injection = `(${turnVar}.status===\`failed\`&&!${hasQueueVar}&&setTimeout(async()=>{try{globalThis.__codexAutoRetries=globalThis.__codexAutoRetries||new Map();let _ar=globalThis.__codexAutoRetries.get(${convVar})||{count:0,time:0};if(Date.now()-_ar.time>3e5)_ar={count:0,time:Date.now()};if(_ar.count<3){_ar.count++;_ar.time=Date.now();globalThis.__codexAutoRetries.set(${convVar},_ar);await ${mgrVar}.startEmptyTurn(${convVar},{turnTrigger:\`capacity_retry_automatic\`,continuationInput:[{type:\`text\`,text:\`继续未完成的工作\`,text_elements:[]}]})}}catch(e){}},3e3)),`;
+  const [fullMatch, eventsVar, convVar, mgrVar, turnVar] = mEmit;
 
-  const patched = source.replace(
-    fullMatch,
-    `${prefix}${injection}${eventsVar}.events.emitTurnCompleted({conversationId:${convVar},hostId:${mgrVar}.getHostId(),status:${turnVar}.status`,
-  );
+  // 注入逻辑：
+  // 1) 轮次成功完成时清空连续重试计数
+  // 2) 失败/错误且无排队消息时，3 秒后在后台通过 startEmptyTurn 调度重试，以 'executor' 身份唤醒会话（彻底免受窗口失焦或非前台阻断）
+  const injection = `(${turnVar}.status===\`completed\`&&globalThis.__codexAutoRetries?.delete(${convVar})),((${turnVar}.status===\`failed\`||${turnVar}.status===\`error\`||(${turnVar}.status!==\`completed\`&&${turnVar}.status!==\`interrupted\`&&${turnVar}.error!=null))&&!(${mgrVar}.turnCoordinator?.readHead?.(${convVar}))&&setTimeout(async()=>{try{globalThis.__codexAutoRetries=globalThis.__codexAutoRetries||new Map();let _ar=globalThis.__codexAutoRetries.get(${convVar})||{count:0,time:0};if(Date.now()-_ar.time>3e5)_ar={count:0,time:Date.now()};if(_ar.count<3){_ar.count++;_ar.time=Date.now();globalThis.__codexAutoRetries.set(${convVar},_ar);await ${mgrVar}.startEmptyTurn(${convVar},{resumeSource:\`executor\`,turnTrigger:\`capacity_retry_automatic\`,continuationInput:[{type:\`text\`,text:\`继续未完成的工作\`,text_elements:[]}]})}}catch(e){}},3e3)),`;
+
+  patched = patched.replace(fullMatch, `${injection}${fullMatch}`);
 
   try {
     parseCode(patched);
