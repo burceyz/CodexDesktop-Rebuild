@@ -6,6 +6,7 @@ const acorn = require("acorn");
 const {
   BACKGROUND_RETRY_MARKER,
   BACKGROUND_THROTTLING_MARKER,
+  BACKGROUND_RETRY_DELAY_MS,
   DIRECT_RETRY_TRIGGER,
   LEGACY_CONTINUATION_INPUT,
   buildBackgroundRetryExpression,
@@ -146,6 +147,19 @@ test("后台补丁挂在 turn/completed 链路且不注入续接消息", () => {
   assert.equal(second.source, result.source);
 });
 
+test("已生成的递增退避补丁会迁移为固定 3 秒", () => {
+  const fixed = patchInitialSource(createInitialBundle()).source;
+  const legacy = fixed.replace(
+    "_state={turnId:s.id,timer:null},_delay=3000",
+    "_state={turnId:s.id,attempt:(_old?.attempt??0)+1,timer:null},_delay=[3e3,5e3,1e4,2e4,3e4][Math.min(_state.attempt-1,4)]",
+  );
+  const result = patchInitialSource(legacy);
+
+  assert.equal(result.status, "patched");
+  assert.match(result.source, /_state=\{turnId:s\.id,timer:null\},_delay=3000/);
+  assert.doesNotMatch(result.source, /\[3e3,5e3,1e4,2e4,3e4\]/);
+});
+
 test("新版恢复链路使用 executor，而不依赖 view", () => {
   const result = patchInitialSource(createInitialBundle({ executorResume: true }));
 
@@ -235,14 +249,14 @@ test("无法准确移除旧版后台注入时明确失败", () => {
   assert.equal(result.status, "legacy-cleanup-not-found");
 });
 
-test("高负载失败在后台直接启动空轮次，首个退避为 3 秒", async () => {
+test("高负载失败固定每 3 秒在后台直接启动空轮次", async () => {
   const fixture = createRetryContext({
     error: { message: "We're currently experiencing high demand." },
   });
 
   assert.equal(evaluateRetryExpression(fixture.context), true);
   assert.equal(fixture.timers.length, 1);
-  assert.equal(fixture.timers[0].delay, 3000);
+  assert.equal(fixture.timers[0].delay, BACKGROUND_RETRY_DELAY_MS);
 
   await fixture.timers[0].callback();
   assert.equal(fixture.started.length, 1);
@@ -250,6 +264,19 @@ test("高负载失败在后台直接启动空轮次，首个退避为 3 秒", as
   assert.equal(fixture.started[0][1].resumeSource, "executor");
   assert.equal(fixture.started[0][1].turnTrigger, DIRECT_RETRY_TRIGGER);
   assert.equal("continuationInput" in fixture.started[0][1], false);
+  assert.equal(fixture.timers[1].delay, BACKGROUND_RETRY_DELAY_MS);
+});
+
+test("重试表达式不保留递增退避间隔", () => {
+  const expression = buildBackgroundRetryExpression({
+    conversationId: "conversationId",
+    manager: "manager",
+    turn: "turn",
+  });
+
+  assert.match(expression, /_delay=3000/);
+  assert.doesNotMatch(expression, /\[3e3,5e3,1e4,2e4,3e4\]/);
+  assert.doesNotMatch(expression, /attempt:/);
 });
 
 test("额度错误或已有排队消息不会启动后台自动重试", () => {
@@ -295,6 +322,7 @@ test("失败轮次仍处于 active 状态时等待空闲而不丢弃重试", asy
 
   assert.equal(fixture.started.length, 0);
   assert.equal(fixture.timers.length, 2);
+  assert.equal(fixture.timers[1].delay, BACKGROUND_RETRY_DELAY_MS);
   assert.equal(
     fixture.context.__codexDirectRetryState.has("conversation-1"),
     true,

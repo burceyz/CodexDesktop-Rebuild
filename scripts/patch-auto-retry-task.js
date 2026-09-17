@@ -9,8 +9,8 @@
  *   注入“继续未完成的工作”一类提示文本。
  * - 仅处理 serverOverloaded 和明确的暂时性连接/容量错误，避免对额度、权限或
  *   用户主动中断进行自动重试。
- * - 每个会话只有一个定时器。退避为 3、5、10、20、30 秒，成功、手动新轮次或
- *   有排队消息时均会自然取消，不再存在需要人工解锁的固定次数上限。
+ * - 每个会话只有一个定时器。所有自动重试固定每 3 秒执行一次；成功、手动新轮次
+ *   或有排队消息时均会自然取消，不存在需要人工解锁的固定次数上限。
  * - 主会话窗口显式禁用 Electron 的后台节流，确保失焦、切换窗口或最小化后
  *   仍按上述退避时间执行；不影响浮层、快捷输入等辅助窗口。
  *
@@ -26,6 +26,7 @@ const BACKGROUND_RETRY_MARKER = "__codexDirectRetryState";
 const BACKGROUND_THROTTLING_MARKER = "codex-background-direct-retry";
 const LEGACY_RETRY_MARKER = "__codexAutoRetries";
 const DIRECT_RETRY_TRIGGER = "capacity_retry_automatic";
+const BACKGROUND_RETRY_DELAY_MS = 3e3;
 const LEGACY_CONTINUATION_INPUT =
   "continuationInput:[{type:`text`,text:`继续未完成的工作`,text_elements:[]}]";
 
@@ -175,7 +176,7 @@ function patchMainSource(source) {
  * `streamRole !== follower && emitTurnCompleted(...)` 仍保留其短路语义。
  */
 function buildBackgroundRetryExpression({ conversationId, manager, turn }) {
-  return `(()=>{let _store=globalThis.${BACKGROUND_RETRY_MARKER}??(globalThis.${BACKGROUND_RETRY_MARKER}=new Map()),_old=_store.get(${conversationId});if(${turn}.status==="completed"){_old?.timer!=null&&clearTimeout(_old.timer),_store.delete(${conversationId});return!0}let _error=${turn}.error,_detail=String(_error?.codexErrorInfo??"")+" "+String(_error?.message??""),_retryable=${turn}.status==="failed"&&(_error?.codexErrorInfo==="serverOverloaded"||/currently experiencing high demand|server[ _-]?overload|temporary errors?|response(?:stream)?(?:connection)?(?:failed|disconnected)|connection failure|too many failed attempts/i.test(_detail));if(!_retryable||${manager}.getStreamRole(${conversationId})?.role!=="owner"||${manager}.turnCoordinator?.readHead?.(${conversationId})){_old?.timer!=null&&clearTimeout(_old.timer),_store.delete(${conversationId});return!0}if(_old?.turnId===${turn}.id)return!0;_old?.timer!=null&&clearTimeout(_old.timer);let _state={turnId:${turn}.id,attempt:(_old?.attempt??0)+1,timer:null},_delay=[3e3,5e3,1e4,2e4,3e4][Math.min(_state.attempt-1,4)],_schedule=()=>{_store.get(${conversationId})===_state&&(_state.timer=setTimeout(_run,_delay))},_run=async()=>{let _current=_store.get(${conversationId});if(_current!==_state)return;_current.timer=null;let _turn=${manager}.getTurn?.(${conversationId},_state.turnId);if((_turn?.status??${turn}.status)!=="failed"||${manager}.turnCoordinator?.readHead?.(${conversationId})){_store.get(${conversationId})===_state&&_store.delete(${conversationId});return}if(${manager}.getConversation(${conversationId})?.threadRuntimeStatus?.type==="active"){_schedule();return}try{await ${manager}.startEmptyTurn(${conversationId},{resumeSource:"executor",turnTrigger:"${DIRECT_RETRY_TRIGGER}"})}catch{}if(_store.get(${conversationId})!==_state)return;if((${manager}.getTurn?.(${conversationId},_state.turnId)?.status??${turn}.status)!=="failed"||${manager}.turnCoordinator?.readHead?.(${conversationId})){_store.delete(${conversationId});return}_schedule()};_store.set(${conversationId},_state),_schedule();return!0})()&&`;
+  return `(()=>{let _store=globalThis.${BACKGROUND_RETRY_MARKER}??(globalThis.${BACKGROUND_RETRY_MARKER}=new Map()),_old=_store.get(${conversationId});if(${turn}.status==="completed"){_old?.timer!=null&&clearTimeout(_old.timer),_store.delete(${conversationId});return!0}let _error=${turn}.error,_detail=String(_error?.codexErrorInfo??"")+" "+String(_error?.message??""),_retryable=${turn}.status==="failed"&&(_error?.codexErrorInfo==="serverOverloaded"||/currently experiencing high demand|server[ _-]?overload|temporary errors?|response(?:stream)?(?:connection)?(?:failed|disconnected)|connection failure|too many failed attempts/i.test(_detail));if(!_retryable||${manager}.getStreamRole(${conversationId})?.role!=="owner"||${manager}.turnCoordinator?.readHead?.(${conversationId})){_old?.timer!=null&&clearTimeout(_old.timer),_store.delete(${conversationId});return!0}if(_old?.turnId===${turn}.id)return!0;_old?.timer!=null&&clearTimeout(_old.timer);let _state={turnId:${turn}.id,timer:null},_delay=${BACKGROUND_RETRY_DELAY_MS},_schedule=()=>{_store.get(${conversationId})===_state&&(_state.timer=setTimeout(_run,_delay))},_run=async()=>{let _current=_store.get(${conversationId});if(_current!==_state)return;_current.timer=null;let _turn=${manager}.getTurn?.(${conversationId},_state.turnId);if((_turn?.status??${turn}.status)!=="failed"||${manager}.turnCoordinator?.readHead?.(${conversationId})){_store.get(${conversationId})===_state&&_store.delete(${conversationId});return}if(${manager}.getConversation(${conversationId})?.threadRuntimeStatus?.type==="active"){_schedule();return}try{await ${manager}.startEmptyTurn(${conversationId},{resumeSource:"executor",turnTrigger:"${DIRECT_RETRY_TRIGGER}"})}catch{}if(_store.get(${conversationId})!==_state)return;if((${manager}.getTurn?.(${conversationId},_state.turnId)?.status??${turn}.status)!=="failed"||${manager}.turnCoordinator?.readHead?.(${conversationId})){_store.delete(${conversationId});return}_schedule()};_store.set(${conversationId},_state),_schedule();return!0})()&&`;
 }
 
 function removeLegacyBackgroundRetry(source) {
@@ -195,7 +196,32 @@ function removeLegacyBackgroundRetry(source) {
  */
 function patchInitialSource(source) {
   if (source.includes(BACKGROUND_RETRY_MARKER)) {
-    return { status: "already-patched", source };
+    const legacyBackoffPattern =
+      /_state=\{turnId:([a-zA-Z0-9_$]+)\.id,attempt:\(_old\?\.attempt\?\?0\)\+1,timer:null\},_delay=\[3e3,5e3,1e4,2e4,3e4\]\[Math\.min\(_state\.attempt-1,4\)\]/g;
+    const legacyBackoffMatches = [
+      ...source.matchAll(new RegExp(legacyBackoffPattern.source, "g")),
+    ];
+    if (legacyBackoffMatches.length === 0) {
+      return { status: "already-patched", source };
+    }
+    if (legacyBackoffMatches.length !== 1) {
+      return {
+        status: "unexpected-retry-delay-count",
+        count: legacyBackoffMatches.length,
+        source,
+      };
+    }
+
+    const upgraded = source.replace(
+      legacyBackoffPattern,
+      `_state={turnId:${legacyBackoffMatches[0][1]}.id,timer:null},_delay=${BACKGROUND_RETRY_DELAY_MS}`,
+    );
+    try {
+      parseCode(upgraded);
+    } catch (error) {
+      return { status: "parse-failed", error, source };
+    }
+    return { status: "patched", source: upgraded };
   }
 
   let patched = removeLegacyBackgroundRetry(source);
@@ -306,6 +332,11 @@ function main() {
       failed++;
       continue;
     }
+    if (result.status === "unexpected-retry-delay-count") {
+      console.log(`  [x] ${label}: fixed-delay migration anchor count is ${result.count}`);
+      failed++;
+      continue;
+    }
     if (result.status === "parse-failed") {
       console.log(`  [x] ${label}: background retry parse failed: ${result.error.message}`);
       failed++;
@@ -370,6 +401,7 @@ if (require.main === module) main();
 module.exports = {
   BACKGROUND_RETRY_MARKER,
   BACKGROUND_THROTTLING_MARKER,
+  BACKGROUND_RETRY_DELAY_MS,
   DIRECT_RETRY_TRIGGER,
   LEGACY_CONTINUATION_INPUT,
   buildBackgroundRetryExpression,
