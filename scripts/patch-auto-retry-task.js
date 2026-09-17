@@ -45,6 +45,13 @@ function parseCode(code) {
  * 这里只清理已经被旧版补丁处理过的 bundle，保证可安全地在现有源码上重跑。
  */
 function patchPrimarySource(source) {
+  if (
+    !source.includes(LEGACY_RETRY_MARKER) &&
+    !source.includes("继续未完成的工作")
+  ) {
+    return { status: "already-patched", source };
+  }
+
   let patched = source;
   let modified = false;
 
@@ -106,6 +113,33 @@ function patchPrimarySource(source) {
  * setTimeout；只对承载会话的 primary 窗口关闭该策略，保证后台调度器准时运行。
  */
 function patchMainSource(source) {
+  const patchedPattern = new RegExp(
+    `backgroundThrottling:([a-zA-Z0-9_$]+)===\\\`primary\\\`\\?!1:void 0/\\*${BACKGROUND_THROTTLING_MARKER}\\*/`,
+  );
+  const patchedMatches = [...source.matchAll(new RegExp(patchedPattern.source, "g"))];
+  if (patchedMatches.length > 0) {
+    if (patchedMatches.length !== 1) {
+      return {
+        status: "unexpected-background-throttling-count",
+        count: patchedMatches.length,
+        source,
+      };
+    }
+
+    // 升级本补丁的早期版本：保留上游 avatarOverlay 本来就有的豁免。
+    const appearanceVar = patchedMatches[0][1];
+    const upgraded = source.replace(
+      patchedPattern,
+      `backgroundThrottling:(${appearanceVar}===\`primary\`||${appearanceVar}===\`avatarOverlay\`)?!1:void 0/*${BACKGROUND_THROTTLING_MARKER}*/`,
+    );
+    try {
+      parseCode(upgraded);
+    } catch (error) {
+      return { status: "parse-failed", error, source };
+    }
+    return { status: "patched", source: upgraded };
+  }
+
   if (source.includes(BACKGROUND_THROTTLING_MARKER)) {
     return { status: "already-patched", source };
   }
@@ -124,7 +158,7 @@ function patchMainSource(source) {
   const appearanceVar = matches[0][1];
   const patched = source.replace(
     pattern,
-    `backgroundThrottling:${appearanceVar}===\`primary\`?!1:void 0/*${BACKGROUND_THROTTLING_MARKER}*/`,
+    `backgroundThrottling:(${appearanceVar}===\`primary\`||${appearanceVar}===\`avatarOverlay\`)?!1:void 0/*${BACKGROUND_THROTTLING_MARKER}*/`,
   );
 
   try {
@@ -165,6 +199,9 @@ function patchInitialSource(source) {
   }
 
   let patched = removeLegacyBackgroundRetry(source);
+  if (patched.includes(LEGACY_RETRY_MARKER)) {
+    return { status: "legacy-cleanup-not-found", source };
+  }
 
   // 新版 app-initial 将恢复来源硬编码为 view。executor 可让后台会话走执行器
   // 恢复链；旧版没有该参数时，额外 options 会被安全忽略。
@@ -261,6 +298,11 @@ function main() {
     }
     if (result.status === "not-found") {
       console.log(`  [x] ${label}: turn/completed anchor not found`);
+      failed++;
+      continue;
+    }
+    if (result.status === "legacy-cleanup-not-found") {
+      console.log(`  [x] ${label}: legacy background retry cleanup anchor not found`);
       failed++;
       continue;
     }

@@ -158,10 +158,25 @@ test("仅主会话窗口关闭后台节流，保证最小化时重试计时继�
 
   assert.equal(result.status, "patched");
   assert.match(result.source, new RegExp(BACKGROUND_THROTTLING_MARKER));
-  assert.match(result.source, /backgroundThrottling:o===`primary`\?!1:void 0/);
+  assert.match(
+    result.source,
+    /backgroundThrottling:\(o===`primary`\|\|o===`avatarOverlay`\)\?!1:void 0/,
+  );
   assert.doesNotThrow(() =>
     acorn.parse(result.source, { ecmaVersion: "latest", sourceType: "script" }),
   );
+  assert.equal(patchMainSource(result.source).status, "already-patched");
+});
+
+test("早期主窗口节流补丁升级时保留 avatarOverlay 豁免", () => {
+  const earlyPatched = createMainBundle().replace(
+    "backgroundThrottling:o!==`avatarOverlay`&&void 0",
+    `backgroundThrottling:o===\`primary\`?!1:void 0/*${BACKGROUND_THROTTLING_MARKER}*/`,
+  );
+  const result = patchMainSource(earlyPatched);
+
+  assert.equal(result.status, "patched");
+  assert.match(result.source, /o===`avatarOverlay`/);
   assert.equal(patchMainSource(result.source).status, "already-patched");
 });
 
@@ -188,6 +203,15 @@ test("旧版 UI 补丁迁移后恢复直接空轮次重试", () => {
   assert.equal(patchPrimarySource(result.source).status, "already-patched");
 });
 
+test("没有旧版标记的 UI bundle 不会修改无关角色或错误判断", () => {
+  const source =
+    "function keepPolicy(a,s){return a.errorInfo!=`usageLimitExceeded`&&s?.role!==`follower`}";
+  const result = patchPrimarySource(source);
+
+  assert.equal(result.status, "already-patched");
+  assert.equal(result.source, source);
+});
+
 test("旧版后台注入会被替换为新的直接重试调度器", () => {
   const source = createInitialBundle().replace(
     "i.events.emitTurnCompleted",
@@ -199,6 +223,16 @@ test("旧版后台注入会被替换为新的直接重试调度器", () => {
   assert.match(result.source, new RegExp(BACKGROUND_RETRY_MARKER));
   assert.doesNotMatch(result.source, /__codexAutoRetries/);
   assert.doesNotMatch(result.source, /continuationInput/);
+});
+
+test("无法准确移除旧版后台注入时明确失败", () => {
+  const source = createInitialBundle().replace(
+    "i.events.emitTurnCompleted",
+    "globalThis.__codexAutoRetries=new Map();i.events.emitTurnCompleted",
+  );
+  const result = patchInitialSource(source);
+
+  assert.equal(result.status, "legacy-cleanup-not-found");
 });
 
 test("高负载失败在后台直接启动空轮次，首个退避为 3 秒", async () => {
