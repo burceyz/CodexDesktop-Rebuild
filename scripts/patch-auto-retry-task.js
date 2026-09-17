@@ -11,6 +11,8 @@
  *   用户主动中断进行自动重试。
  * - 每个会话只有一个定时器。退避为 3、5、10、20、30 秒，成功、手动新轮次或
  *   有排队消息时均会自然取消，不再存在需要人工解锁的固定次数上限。
+ * - 主会话窗口显式禁用 Electron 的后台节流，确保失焦、切换窗口或最小化后
+ *   仍按上述退避时间执行；不影响浮层、快捷输入等辅助窗口。
  *
  * Usage:
  *   node scripts/patch-auto-retry-task.js [platform]   # mac-arm64 | mac-x64 | win | 省略=全部
@@ -21,6 +23,7 @@ const acorn = require("acorn");
 const { locateBundles, relPath } = require("./patch-util");
 
 const BACKGROUND_RETRY_MARKER = "__codexDirectRetryState";
+const BACKGROUND_THROTTLING_MARKER = "codex-background-direct-retry";
 const LEGACY_RETRY_MARKER = "__codexAutoRetries";
 const DIRECT_RETRY_TRIGGER = "capacity_retry_automatic";
 const LEGACY_CONTINUATION_INPUT =
@@ -88,6 +91,41 @@ function patchPrimarySource(source) {
   );
 
   if (!modified) return { status: "already-patched", source };
+
+  try {
+    parseCode(patched);
+  } catch (error) {
+    return { status: "parse-failed", error, source };
+  }
+
+  return { status: "patched", source: patched };
+}
+
+/**
+ * app-initial 在 renderer 中运行。Electron 默认会节流非前台 renderer 的
+ * setTimeout；只对承载会话的 primary 窗口关闭该策略，保证后台调度器准时运行。
+ */
+function patchMainSource(source) {
+  if (source.includes(BACKGROUND_THROTTLING_MARKER)) {
+    return { status: "already-patched", source };
+  }
+
+  const pattern =
+    /backgroundThrottling:([a-zA-Z0-9_$]+)!==`avatarOverlay`&&void 0/;
+  const matches = [...source.matchAll(new RegExp(pattern.source, "g"))];
+  if (matches.length !== 1) {
+    return {
+      status: "unexpected-background-throttling-count",
+      count: matches.length,
+      source,
+    };
+  }
+
+  const appearanceVar = matches[0][1];
+  const patched = source.replace(
+    pattern,
+    `backgroundThrottling:${appearanceVar}===\`primary\`?!1:void 0/*${BACKGROUND_THROTTLING_MARKER}*/`,
+  );
 
   try {
     parseCode(patched);
@@ -243,6 +281,45 @@ function main() {
     patched++;
   }
 
+  const mainBundles = locateBundles({
+    dir: "build",
+    pattern: /^main(?:-.*)?\.js$/,
+    platform,
+  });
+
+  for (const bundle of mainBundles) {
+    const source = fs.readFileSync(bundle.path, "utf-8");
+    const result = patchMainSource(source);
+    const label = relPath(bundle.path);
+
+    if (result.status === "already-patched") {
+      console.log(`  [ok] ${label}: primary-window background timer policy already patched`);
+      continue;
+    }
+    if (result.status === "unexpected-background-throttling-count") {
+      console.log(
+        `  [x] ${label}: primary-window background timer anchor count is ${result.count}`,
+      );
+      failed++;
+      continue;
+    }
+    if (result.status === "parse-failed") {
+      console.log(`  [x] ${label}: background timer parse failed: ${result.error.message}`);
+      failed++;
+      continue;
+    }
+
+    if (isCheck) {
+      console.log(`  [dry-run] ${label}: would disable primary-window background throttling`);
+      patched++;
+      continue;
+    }
+
+    fs.writeFileSync(bundle.path, result.source, "utf-8");
+    console.log(`  [ok] ${label}: disabled primary-window background throttling`);
+    patched++;
+  }
+
   if (failed > 0) process.exitCode = 1;
 }
 
@@ -250,9 +327,11 @@ if (require.main === module) main();
 
 module.exports = {
   BACKGROUND_RETRY_MARKER,
+  BACKGROUND_THROTTLING_MARKER,
   DIRECT_RETRY_TRIGGER,
   LEGACY_CONTINUATION_INPUT,
   buildBackgroundRetryExpression,
   patchInitialSource,
+  patchMainSource,
   patchPrimarySource,
 };

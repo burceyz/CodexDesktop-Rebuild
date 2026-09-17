@@ -5,10 +5,12 @@ const acorn = require("acorn");
 
 const {
   BACKGROUND_RETRY_MARKER,
+  BACKGROUND_THROTTLING_MARKER,
   DIRECT_RETRY_TRIGGER,
   LEGACY_CONTINUATION_INPUT,
   buildBackgroundRetryExpression,
   patchInitialSource,
+  patchMainSource,
   patchPrimarySource,
 } = require("./patch-auto-retry-task");
 
@@ -32,6 +34,15 @@ function createInitialBundle({ executorResume = false } = {}) {
     "r.broadcastConversationSnapshot(c),",
     "r.getStreamRole(c)?.role!==`follower`&&",
     "i.events.emitTurnCompleted({conversationId:c,hostId:r.getHostId(),status:s.status,turnId:s.id})",
+    "}",
+  ].join("");
+}
+
+function createMainBundle() {
+  return [
+    "function createWindow(o){",
+    "let j={preload:path,backgroundThrottling:o!==`avatarOverlay`&&void 0,contextIsolation:!0};",
+    "return new BrowserWindow({webPreferences:j})",
     "}",
   ].join("");
 }
@@ -140,6 +151,25 @@ test("新版恢复链路使用 executor，而不依赖 view", () => {
 
   assert.equal(result.status, "patched");
   assert.match(result.source, /this\.#e\(n,t\?\.resumeSource\?\?`view`\)/);
+});
+
+test("仅主会话窗口关闭后台节流，保证最小化时重试计时继续", () => {
+  const result = patchMainSource(createMainBundle());
+
+  assert.equal(result.status, "patched");
+  assert.match(result.source, new RegExp(BACKGROUND_THROTTLING_MARKER));
+  assert.match(result.source, /backgroundThrottling:o===`primary`\?!1:void 0/);
+  assert.doesNotThrow(() =>
+    acorn.parse(result.source, { ecmaVersion: "latest", sourceType: "script" }),
+  );
+  assert.equal(patchMainSource(result.source).status, "already-patched");
+});
+
+test("主进程后台节流锚点异常时拒绝静默生成不完整补丁", () => {
+  const result = patchMainSource("const options={backgroundThrottling:void 0};");
+
+  assert.equal(result.status, "unexpected-background-throttling-count");
+  assert.equal(result.count, 0);
 });
 
 test("旧版 UI 补丁迁移后恢复直接空轮次重试", () => {
