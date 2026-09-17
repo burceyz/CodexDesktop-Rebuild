@@ -220,6 +220,27 @@ test("重试等待期间出现排队消息会取消后台任务", async () => {
   );
 });
 
+test("失败轮次仍处于 active 状态时等待空闲而不丢弃重试", async () => {
+  const fixture = createRetryContext({
+    error: { codexErrorInfo: "serverOverloaded" },
+  });
+  fixture.state.active = true;
+
+  evaluateRetryExpression(fixture.context);
+  await fixture.timers[0].callback();
+
+  assert.equal(fixture.started.length, 0);
+  assert.equal(fixture.timers.length, 2);
+  assert.equal(
+    fixture.context.__codexDirectRetryState.has("conversation-1"),
+    true,
+  );
+
+  fixture.state.active = false;
+  await fixture.timers[1].callback();
+  assert.equal(fixture.started.length, 1);
+});
+
 test("成功完成会取消同一会话尚未触发的后台定时器", () => {
   const fixture = createRetryContext({
     error: { codexErrorInfo: "serverOverloaded" },
