@@ -36,6 +36,7 @@ const PATCHES = [
   "patch-cdp-screenshot.js",
   "patch-queue-failure-policy.js",
   "patch-auto-retry-task.js",
+  "patch-auto-chat-loop.js",
 ];
 
 function main() {
