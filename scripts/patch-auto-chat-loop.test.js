@@ -10,10 +10,10 @@ const {
   INTERVAL_OPTIONS,
   buildRuntimeExpression,
   patchInitialSource,
-  patchPrimarySource,
+  patchMenuSource,
 } = require("./patch-auto-chat-loop");
 
-function createPrimaryBundle() {
+function createMenuBundle() {
   return [
     "function readModel(e,t,n){return e.get(Sg,n)?.getConversation(t)?.model}",
     "function menu({scope:e,target:t,surface:o,canOpenSideChat:d}){",
@@ -84,8 +84,8 @@ function createManager(overrides = {}) {
   };
 }
 
-test("primary: injects runtime and header menu items before open-side-chat", () => {
-  const result = patchPrimarySource(createPrimaryBundle());
+test("menu: injects runtime and header menu items before open-side-chat", () => {
+  const result = patchMenuSource(createMenuBundle());
   assert.equal(result.status, "patched");
   assert.doesNotThrow(() => parse(result.source));
   assert.ok(result.source.includes("id:`auto-chat-toggle`"));
@@ -99,8 +99,8 @@ test("primary: injects runtime and header menu items before open-side-chat", () 
   );
 });
 
-test("primary: menu items are only pushed for the header surface", () => {
-  const result = patchPrimarySource(createPrimaryBundle());
+test("menu: items are only pushed for the header surface", () => {
+  const result = patchMenuSource(createMenuBundle());
   const context = { globalThis: null, Map, JSON, Array, Math, setTimeout() {}, clearTimeout() {} };
   context.globalThis = context;
   vm.createContext(context);
@@ -118,12 +118,12 @@ test("primary: menu items are only pushed for the header surface", () => {
   assert.equal(sidebar.length, 0);
 });
 
-test("primary: is idempotent and reports missing anchors", () => {
-  const once = patchPrimarySource(createPrimaryBundle());
-  assert.equal(patchPrimarySource(once.source).status, "already-patched");
-  assert.equal(patchPrimarySource("function x(){}").status, "not-found");
+test("menu: is idempotent and skips bundles without the anchor", () => {
+  const once = patchMenuSource(createMenuBundle());
+  assert.equal(patchMenuSource(once.source).status, "already-patched");
+  assert.equal(patchMenuSource("function x(){}").status, "not-present");
   assert.equal(
-    patchPrimarySource(createPrimaryBundle().replace("e.get(Sg,n)", "e.get(Zz,n)").concat("e.get(Sg,n)?.getConversation(")).status,
+    patchMenuSource(createMenuBundle().replace("e.get(Sg,n)", "e.get(Zz,n)").concat("e.get(Sg,n)?.getConversation(")).status,
     "unexpected-manager-atom-count",
   );
 });
@@ -148,6 +148,18 @@ test("initial: coexists with the auto-retry injection at the same anchor", () =>
   const result = patchInitialSource(retried.source);
   assert.equal(result.status, "patched");
   assert.doesNotThrow(() => parse(result.source));
+});
+
+test("initial: one bundle can take both the menu and the turn hook (26.915 layout)", () => {
+  const combined = createMenuBundle() + createInitialBundle();
+  const menu = patchMenuSource(combined);
+  assert.equal(menu.status, "patched");
+  const hook = patchInitialSource(menu.source);
+  assert.equal(hook.status, "patched");
+  assert.doesNotThrow(() => parse(hook.source));
+  assert.equal(patchMenuSource(hook.source).status, "already-patched");
+  assert.equal(patchInitialSource(hook.source).status, "already-patched");
+  assert.equal(patchInitialSource(menu.source).status, "patched");
 });
 
 test("runtime: toggle schedules, sends after interval, reschedules on completion", async () => {

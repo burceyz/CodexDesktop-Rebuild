@@ -6,6 +6,8 @@
  * - 运行时对象 globalThis.__codexAutoChat 只在 app-primary 的会话页菜单里定义一次，
  *   按 conversationId 保存 {enabled, intervalMs, timer}，纯内存，重启即关闭。
  * - 会话页顶部“…”菜单（surface === header）追加一个 checkbox 开关和一组间隔 radio。
+ *   该菜单构建函数在 26.908 位于 app-primary，26.915 起移入 app-initial；补丁在两个
+ *   bundle 中查找锚点，没有锚点的 bundle 跳过。
  * - app-initial 的 turn/completed 处理链只做一件事：通知运行时本会话的轮次状态。
  *   completed → 按间隔调度下一条；interrupted 视为用户介入 → 自动关闭；
  *   failed → 不处理，交给 patch-auto-retry-task 的后台重试，重试完成后再自然接上。
@@ -22,6 +24,8 @@ const acorn = require("acorn");
 const { locateBundles, relPath } = require("./patch-util");
 
 const RUNTIME_MARKER = "__codexAutoChat";
+const MENU_MARKER = "auto-chat-toggle";
+const HOOK_MARKER = `${RUNTIME_MARKER}?.onTurnCompleted`;
 const DEFAULT_INTERVAL_MS = 3e4;
 const INTERVAL_OPTIONS = [
   { ms: 15e3, label: "15 秒" },
@@ -101,10 +105,10 @@ function buildMenuItemsExpression({ scope, conversationId, hostId, managerAtom }
 }
 
 /**
- * app-primary：在会话页菜单 open-side-chat 的 push 语句前插入运行时定义和菜单项。
+ * 会话页菜单：在 open-side-chat 的 push 语句前插入运行时定义和菜单项。
  */
-function patchPrimarySource(source) {
-  if (source.includes(RUNTIME_MARKER)) {
+function patchMenuSource(source) {
+  if (source.includes(MENU_MARKER)) {
     return { status: "already-patched", source };
   }
 
@@ -112,7 +116,7 @@ function patchPrimarySource(source) {
     /([a-zA-Z0-9_$]+)===`header`&&([a-zA-Z0-9_$]+)&&([a-zA-Z0-9_$]+)\.push\(\{id:`open-side-chat`/;
   const anchorMatch = source.match(anchorPattern);
   if (!anchorMatch) {
-    return { status: "not-found", source };
+    return { status: "not-present", source };
   }
   const [anchorText, surface, , items] = anchorMatch;
   const anchorIndex = anchorMatch.index;
@@ -168,7 +172,7 @@ function patchPrimarySource(source) {
  * app-initial：在 turn/completed 事件发出前通知运行时。
  */
 function patchInitialSource(source) {
-  if (source.includes(RUNTIME_MARKER)) {
+  if (source.includes(HOOK_MARKER)) {
     return { status: "already-patched", source };
   }
 
@@ -194,6 +198,7 @@ function patchInitialSource(source) {
 
 function applyBundles({ bundles, patch, isCheck, label }) {
   let failed = 0;
+  let hit = 0;
   for (const bundle of bundles) {
     const source = fs.readFileSync(bundle.path, "utf-8");
     const result = patch(source);
@@ -201,6 +206,10 @@ function applyBundles({ bundles, patch, isCheck, label }) {
 
     if (result.status === "already-patched") {
       console.log(`  [ok] ${name}: ${label} already patched`);
+      continue;
+    }
+    if (result.status === "not-present") {
+      console.log(`  [skip] ${name}: ${label} anchor not in this bundle`);
       continue;
     }
     if (result.status !== "patched") {
@@ -214,6 +223,7 @@ function applyBundles({ bundles, patch, isCheck, label }) {
       failed++;
       continue;
     }
+    hit++;
     if (isCheck) {
       console.log(`  [dry-run] ${name}: would patch ${label}`);
       continue;
@@ -221,7 +231,7 @@ function applyBundles({ bundles, patch, isCheck, label }) {
     fs.writeFileSync(bundle.path, result.source, "utf-8");
     console.log(`  [ok] ${name}: patched ${label}`);
   }
-  return failed;
+  return { failed, hit };
 }
 
 function main() {
@@ -229,21 +239,24 @@ function main() {
   const isCheck = args.includes("--check");
   const platform = args.find((arg) => ["mac-arm64", "mac-x64", "win"].includes(arg));
 
-  let failed = 0;
-  failed += applyBundles({
-    bundles: locateBundles({ dir: "assets", pattern: /^app-primary-.*\.js$/, platform }),
-    patch: patchPrimarySource,
+  // locateBundles 每个平台只返回一个匹配，两个 bundle 需分别定位。
+  const menu = applyBundles({
+    bundles: [
+      ...locateBundles({ dir: "assets", pattern: /^app-initial-.*\.js$/, platform }),
+      ...locateBundles({ dir: "assets", pattern: /^app-primary-.*\.js$/, platform }),
+    ],
+    patch: patchMenuSource,
     isCheck,
     label: "auto chat menu",
   });
-  failed += applyBundles({
+  const hook = applyBundles({
     bundles: locateBundles({ dir: "assets", pattern: /^app-initial-.*\.js$/, platform }),
     patch: patchInitialSource,
     isCheck,
     label: "auto chat turn hook",
   });
 
-  if (failed > 0) process.exitCode = 1;
+  if (menu.failed > 0 || hook.failed > 0) process.exitCode = 1;
 }
 
 if (require.main === module) main();
@@ -255,5 +268,5 @@ module.exports = {
   INTERVAL_OPTIONS,
   buildRuntimeExpression,
   patchInitialSource,
-  patchPrimarySource,
+  patchMenuSource,
 };

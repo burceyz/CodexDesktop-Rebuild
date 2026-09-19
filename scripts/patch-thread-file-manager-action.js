@@ -530,6 +530,12 @@ function patchSidebarSource(source) {
   if (hasNativeDirectAction(source)) {
     return { status: "native", source };
   }
+  // 26.915 起，会话菜单构建函数从 app-primary 移入 app-initial；不含该函数的 bundle 直接跳过。
+  if (
+    !SIDEBAR_PATCHABLE_SIGNATURES.every((signature) => source.includes(signature))
+  ) {
+    return { status: "not-present", source };
+  }
 
   let ast;
   try {
@@ -585,11 +591,19 @@ function findTargets(platform) {
       source: fs.readFileSync(target.path, "utf-8"),
     }))
     .map((target) => ({ ...target, patchKind: "open-menu" }));
-  const sidebarTargets = locateBundles({
-    dir: "assets",
-    pattern: /^app-primary-.*\.js$/,
-    ...(platform ? { platform } : {}),
-  })
+  // locateBundles 每个平台只返回一个匹配；26.915 前菜单在 app-primary，之后在 app-initial。
+  const sidebarTargets = [
+    ...locateBundles({
+      dir: "assets",
+      pattern: /^app-initial-.*\.js$/,
+      ...(platform ? { platform } : {}),
+    }),
+    ...locateBundles({
+      dir: "assets",
+      pattern: /^app-primary-.*\.js$/,
+      ...(platform ? { platform } : {}),
+    }),
+  ]
     .map((target) => ({
       ...target,
       source: fs.readFileSync(target.path, "utf-8"),
@@ -627,6 +641,10 @@ function main() {
     }
     if (result.status === "already-patched") {
       console.log(`  [ok] ${label}: already patched`);
+      continue;
+    }
+    if (result.status === "not-present") {
+      console.log(`  [skip] ${label}: no sidebar menu builder in this bundle`);
       continue;
     }
     if (result.status === "patched") {

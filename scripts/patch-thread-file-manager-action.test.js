@@ -230,11 +230,17 @@ test("侧边栏补丁重复执行保持幂等", () => {
 
 test("侧边栏结构变化时明确失败而不是静默跳过", () => {
   const result = patchSidebarSource(
-    "function changedThreadMenu(){return [{id:`rename-thread`}]}",
+    "function changedThreadMenu(){return [{id:`rename-thread`},{id:`archive-thread`},{id:`open-in-new-window`}]}",
   );
 
   assert.equal(result.status, "unexpected-sidebar-menu-gate-count");
   assert.equal(result.count, 0);
+});
+
+test("不含会话菜单构建函数的 bundle 报告 not-present", () => {
+  const result = patchSidebarSource("function other(){return [{id:`rename-thread`}]}");
+
+  assert.equal(result.status, "not-present");
 });
 
 test("补丁重复执行保持幂等", () => {
