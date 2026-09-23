@@ -100,6 +100,32 @@ function isOwlRuntime(appDir) {
   );
 }
 
+function assertWindowsPortableRuntime(asarDir) {
+  const manifestPath = path.join(asarDir, "package.json");
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  if (manifest.codexWindowsAppContainedCore === "1") {
+    throw new Error(
+      "Windows portable build still requires an MSIX package identity. Run patch-all.js win first.",
+    );
+  }
+  return manifest;
+}
+
+function ensureWindowsPortableLauncher(appDir) {
+  if (!isOwlRuntime(appDir)) return null;
+
+  const runtimePath = path.join(appDir, "ChatGPT.exe");
+  const launcherPath = path.join(appDir, "Codex.exe");
+  if (!fs.existsSync(runtimePath)) {
+    throw new Error("Windows Owl runtime executable not found: ChatGPT.exe");
+  }
+
+  // MSIX 中的 Codex.exe 是依赖程序包身份的存根；便携包需直接启动 Owl runtime。
+  fs.copyFileSync(runtimePath, launcherPath);
+  console.log("   [launcher] Codex.exe -> portable Owl runtime");
+  return launcherPath;
+}
+
 function asarCliPath() {
   return path.join(PROJECT_ROOT, "node_modules", "@electron", "asar", "bin", "asar.mjs");
 }
@@ -254,6 +280,10 @@ function buildWin(platform) {
     process.exit(1);
   }
 
+  if (isOwlRuntime(appDir)) {
+    assertWindowsPortableRuntime(asarDir);
+  }
+
   // 即使绕过同步步骤，也禁止将旧的 ARM64 缓存打包成 x64 产物。
   try {
     const identity = validateWindowsPackage(extractDir, {
@@ -293,6 +323,8 @@ function buildWin(platform) {
   if (oldHash !== newHash) {
     patchWindowsAsarIntegrity(outApp, oldHash, newHash);
   }
+
+  ensureWindowsPortableLauncher(outApp);
 
   // 保留上游 Windows CLI，使 app-server、code-mode host 与本地工具运行时版本一致。
   keepUpstreamCodex(platform, resourcesDir, "codex.exe");
@@ -463,8 +495,10 @@ function main() {
 if (require.main === module) main();
 
 module.exports = {
+  assertWindowsPortableRuntime,
   computeAsarHeaderHash,
   createDmg,
+  ensureWindowsPortableLauncher,
   isOwlRuntime,
   isRetryableHdiutilError,
   keepUpstreamCodex,

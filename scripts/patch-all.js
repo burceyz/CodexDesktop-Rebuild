@@ -19,6 +19,7 @@ const PATCHES = [
   "patch-devtools.js",
   "patch-fast-mode.js",
   "patch-codex-home-env.js",
+  "patch-windows-portable-runtime.js",
   "patch-model-catalog-filter.js",
   "patch-model-picker-submenu.js",
   "patch-thread-file-manager-action.js",

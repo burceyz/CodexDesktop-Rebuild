@@ -4,9 +4,10 @@
  *
  * 26.825 起，上游把工作区的所有打开目标统一收进“打开方式”子菜单；
  * 26.901 又把侧边栏会话菜单拆到 app-primary，并仅为 Git 会话调用该菜单；
- * 26.908 将该限制移入派生选择器。本补丁先复用打开链路增加顶层入口，
- * 再放宽两种结构中的 Git 限制，使所有有工作目录的本地会话都能显示入口。
- * 旧版若已提供 open-thread-folder，则安全跳过。
+ * 26.908 将该限制移入派生选择器；26.911 又将菜单构造器移回 app-initial。
+ * 本补丁先复用打开链路增加顶层入口，再按内容定位侧边栏菜单并放宽两种
+ * 结构中的 Git 限制，使所有有工作目录的本地会话都能显示入口。旧版若已
+ * 提供 open-thread-folder，则安全跳过。
  *
  * Usage:
  *   node scripts/patch-thread-file-manager-action.js [platform]
@@ -31,6 +32,18 @@ const SIDEBAR_PATCHABLE_SIGNATURES = [
   "id:`archive-thread`",
   "id:`open-in-new-window`",
 ];
+const SIDEBAR_BUNDLE_SIGNATURES = [
+  "rename-thread",
+  "archive-thread",
+  "open-in-new-window",
+  "remote_control_connections",
+];
+
+function hasSidebarMenuSignatures(source) {
+  return SIDEBAR_BUNDLE_SIGNATURES.every((signature) =>
+    source.includes(signature),
+  );
+}
 
 function walk(node, visitor) {
   if (!node || typeof node !== "object") return;
@@ -581,7 +594,7 @@ function patchSidebarSource(source) {
 }
 
 function findTargets(platform) {
-  const openMenuTargets = locateBundles({
+  const appInitialTargets = locateBundles({
     dir: "assets",
     pattern: /^app-initial-.*\.js$/,
     ...(platform ? { platform } : {}),
@@ -589,25 +602,26 @@ function findTargets(platform) {
     .map((target) => ({
       ...target,
       source: fs.readFileSync(target.path, "utf-8"),
-    }))
-    .map((target) => ({ ...target, patchKind: "open-menu" }));
-  // locateBundles 每个平台只返回一个匹配；26.915 前菜单在 app-primary，之后在 app-initial。
-  const sidebarTargets = [
-    ...locateBundles({
-      dir: "assets",
-      pattern: /^app-initial-.*\.js$/,
-      ...(platform ? { platform } : {}),
-    }),
-    ...locateBundles({
-      dir: "assets",
-      pattern: /^app-primary-.*\.js$/,
-      ...(platform ? { platform } : {}),
-    }),
-  ]
+    }));
+  const appPrimaryTargets = locateBundles({
+    dir: "assets",
+    pattern: /^app-primary-.*\.js$/,
+    ...(platform ? { platform } : {}),
+  })
     .map((target) => ({
       ...target,
       source: fs.readFileSync(target.path, "utf-8"),
-    }))
+    }));
+
+  const openMenuTargets = appInitialTargets.map((target) => ({
+    ...target,
+    patchKind: "open-menu",
+  }));
+  const sidebarTargets = [...appInitialTargets, ...appPrimaryTargets]
+    .filter(
+      ({ source }) =>
+        source.includes(SIDEBAR_MARKER) || hasSidebarMenuSignatures(source),
+    )
     .map((target) => ({ ...target, patchKind: "sidebar" }));
 
   return [...openMenuTargets, ...sidebarTargets];
@@ -628,10 +642,12 @@ function main() {
   let failed = 0;
   for (const target of targets) {
     const label = relPath(target.path);
+    // 新版的两个补丁可能落在同一 bundle，必须读取上一阶段写入后的内容。
+    const source = fs.readFileSync(target.path, "utf-8");
     const result =
       target.patchKind === "sidebar"
-        ? patchSidebarSource(target.source)
-        : patchSource(target.source);
+        ? patchSidebarSource(source)
+        : patchSource(source);
 
     if (result.status === "native") {
       console.log(
@@ -683,6 +699,7 @@ module.exports = {
   MARKER,
   SIDEBAR_MARKER,
   findTargets,
+  hasSidebarMenuSignatures,
   hasNativeDirectAction,
   patchSidebarSource,
   patchSource,

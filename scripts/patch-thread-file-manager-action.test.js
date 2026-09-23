@@ -7,6 +7,7 @@ const {
   DIRECT_ACTION_ID,
   MARKER,
   SIDEBAR_MARKER,
+  hasSidebarMenuSignatures,
   hasNativeDirectAction,
   patchSidebarSource,
   patchSource,
@@ -216,6 +217,27 @@ test("兼容 26.908 将 Git 限制移入派生选择器的结构", () => {
       remoteConnections: [{ hostId: "local" }],
     }).some((item) => item.id === DIRECT_ACTION_ID),
     false,
+  );
+});
+
+test("兼容 26.911 将侧边栏菜单合并到 app-initial 的结构", () => {
+  const original = createGroupedMenuBundle() + createSelectorSidebarMenuBundle();
+
+  assert.equal(hasSidebarMenuSignatures(original), true);
+  assert.equal(hasSidebarMenuSignatures(createGroupedMenuBundle()), false);
+
+  const openMenuResult = patchSource(original);
+  assert.equal(openMenuResult.status, "patched");
+
+  const sidebarResult = patchSidebarSource(openMenuResult.source);
+  assert.equal(sidebarResult.status, "patched");
+  assert.ok(sidebarResult.source.includes(MARKER));
+  assert.ok(sidebarResult.source.includes(SIDEBAR_MARKER));
+  assert.doesNotThrow(() =>
+    acorn.parse(sidebarResult.source, {
+      ecmaVersion: "latest",
+      sourceType: "module",
+    }),
   );
 });
 
