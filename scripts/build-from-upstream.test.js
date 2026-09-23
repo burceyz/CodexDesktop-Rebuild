@@ -5,7 +5,9 @@ const os = require("node:os");
 const path = require("node:path");
 
 const {
+  assertWindowsPortableRuntime,
   createDmg,
+  ensureWindowsPortableLauncher,
   isRetryableHdiutilError,
   keepUpstreamCodex,
   patchWindowsAsarIntegrity,
@@ -98,6 +100,36 @@ test("Windows Owl runtime 修补 ChatGPT.exe 中的 ASAR 哈希", (t) => {
   assert.equal(patchWindowsAsarIntegrity(directory, oldHash, newHash), chatGptExe);
   assert.equal(fs.readFileSync(chatGptExe, "utf8"), `prefix:${newHash}:suffix`);
   assert.equal(fs.readFileSync(codexExe, "utf8"), "launcher-without-integrity-hash");
+});
+
+test("Windows Owl 便携包使用真实 runtime 覆盖 MSIX 启动存根", (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "codex-owl-launcher-test-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+
+  const resourcesDir = path.join(directory, "resources");
+  fs.mkdirSync(resourcesDir, { recursive: true });
+  fs.writeFileSync(path.join(directory, "owl-shell-runtime.json"), "{}");
+  fs.writeFileSync(path.join(resourcesDir, "owl-electron-app.json"), "{}");
+  fs.writeFileSync(path.join(directory, "ChatGPT.exe"), "owl-runtime");
+  fs.writeFileSync(path.join(directory, "Codex.exe"), "msix-stub");
+
+  assert.equal(
+    ensureWindowsPortableLauncher(directory),
+    path.join(directory, "Codex.exe"),
+  );
+  assert.equal(fs.readFileSync(path.join(directory, "Codex.exe"), "utf8"), "owl-runtime");
+});
+
+test("Windows Owl 便携构建拒绝依赖 MSIX 身份的清单", (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "codex-owl-manifest-test-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+
+  const manifestPath = path.join(directory, "package.json");
+  fs.writeFileSync(manifestPath, JSON.stringify({ codexWindowsAppContainedCore: "1" }));
+  assert.throws(() => assertWindowsPortableRuntime(directory), /MSIX package identity/);
+
+  fs.writeFileSync(manifestPath, JSON.stringify({ codexWindowsAppContainedCore: "0" }));
+  assert.equal(assertWindowsPortableRuntime(directory).codexWindowsAppContainedCore, "0");
 });
 
 test("macOS 和 Windows 保留上游 CLI，Linux 使用平台替换包", () => {
