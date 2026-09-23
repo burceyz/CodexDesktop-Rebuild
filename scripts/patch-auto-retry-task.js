@@ -1,16 +1,19 @@
 #!/usr/bin/env node
 /**
- * patch-auto-retry-task.js — 在后台直接重试暂时性服务过载失败的轮次。
+ * patch-auto-retry-task.js — 在后台直接重试暂时性服务过载/限流失败的轮次。
  *
  * 设计：
  * - 调度器注入 app-initial 的 turn/completed 处理链，而不是 React 错误卡片；
- *   因此切换会话、最小化窗口或窗口失焦都不会取消重试。
- * - 调用 startEmptyTurn，保留原会话上下文且 input 为空；不发送用户消息，也不
- *   注入“继续未完成的工作”一类提示文本。
- * - 仅处理 serverOverloaded 和明确的暂时性连接/容量错误，避免对额度、权限或
- *   用户主动中断进行自动重试。
- * - 每个会话只有一个定时器。所有自动重试固定每 3 秒执行一次；成功、手动新轮次
- *   或有排队消息时均会自然取消，不存在需要人工解锁的固定次数上限。
+ *   因此切换会话、最小化窗口或窗口失焦都不会取消重试。轮次只有在 CLI 内部
+ *   “正在重新连接 N/N”全部失败后才会以 failed 结束，所以重试总在重连耗尽之后。
+ * - 过载与连接类错误：每 3 秒调用 startEmptyTurn，保留原会话上下文且 input 为空，
+ *   不发送用户消息。
+ * - 限流（rateLimitExceeded）：每 30 秒重试一次，避免持续撞限额。同一条失败链
+ *   第一次重试以“继续按照要求执行任务”作为输入，之后的重试沿用这条消息直接重跑
+ *   空轮次，不会刷屏。
+ * - 不处理额度、权限或用户主动中断。结构体形式的 codexErrorInfo 按变体名参与匹配。
+ * - 每个会话只有一个定时器；成功、手动新轮次或有排队消息时均会自然取消，
+ *   不存在需要人工解锁的固定次数上限。
  * - 主会话窗口显式禁用 Electron 的后台节流，确保失焦、切换窗口或最小化后
  *   仍按上述退避时间执行；不影响浮层、快捷输入等辅助窗口。
  *
@@ -27,6 +30,11 @@ const BACKGROUND_THROTTLING_MARKER = "codex-background-direct-retry";
 const LEGACY_RETRY_MARKER = "__codexAutoRetries";
 const DIRECT_RETRY_TRIGGER = "capacity_retry_automatic";
 const BACKGROUND_RETRY_DELAY_MS = 3e3;
+const RATE_LIMIT_RETRY_DELAY_MS = 3e4;
+const RATE_LIMIT_CONTINUATION_TEXT = "继续按照要求执行任务";
+// 已注入的调度器：捕获 conversationId、turn、manager，用于原地升级旧版本。
+const INJECTED_RETRY_PATTERN =
+  /\(\(\)=>\{let _store=globalThis\.__codexDirectRetryState\?\?\(globalThis\.__codexDirectRetryState=new Map\(\)\),_old=_store\.get\(([a-zA-Z0-9_$]+)\);if\(([a-zA-Z0-9_$]+)\.status==="completed"\)[\s\S]*?([a-zA-Z0-9_$]+)\.getStreamRole\(\1\)[\s\S]*?_store\.set\(\1,_state\),_schedule\(\);return!0\}\)\(\)&&/;
 const LEGACY_CONTINUATION_INPUT =
   "continuationInput:[{type:`text`,text:`继续未完成的工作`,text_elements:[]}]";
 
@@ -176,7 +184,35 @@ function patchMainSource(source) {
  * `streamRole !== follower && emitTurnCompleted(...)` 仍保留其短路语义。
  */
 function buildBackgroundRetryExpression({ conversationId, manager, turn }) {
-  return `(()=>{let _store=globalThis.${BACKGROUND_RETRY_MARKER}??(globalThis.${BACKGROUND_RETRY_MARKER}=new Map()),_old=_store.get(${conversationId});if(${turn}.status==="completed"){_old?.timer!=null&&clearTimeout(_old.timer),_store.delete(${conversationId});return!0}let _error=${turn}.error,_detail=String(_error?.codexErrorInfo??"")+" "+String(_error?.message??""),_retryable=${turn}.status==="failed"&&(_error?.codexErrorInfo==="serverOverloaded"||/currently experiencing high demand|server[ _-]?overload|temporary errors?|response(?:stream)?(?:connection)?(?:failed|disconnected)|connection failure|too many failed attempts/i.test(_detail));if(!_retryable||${manager}.getStreamRole(${conversationId})?.role!=="owner"||${manager}.turnCoordinator?.readHead?.(${conversationId})){_old?.timer!=null&&clearTimeout(_old.timer),_store.delete(${conversationId});return!0}if(_old?.turnId===${turn}.id)return!0;_old?.timer!=null&&clearTimeout(_old.timer);let _state={turnId:${turn}.id,timer:null},_delay=${BACKGROUND_RETRY_DELAY_MS},_schedule=()=>{_store.get(${conversationId})===_state&&(_state.timer=setTimeout(_run,_delay))},_run=async()=>{let _current=_store.get(${conversationId});if(_current!==_state)return;_current.timer=null;let _turn=${manager}.getTurn?.(${conversationId},_state.turnId);if((_turn?.status??${turn}.status)!=="failed"||${manager}.turnCoordinator?.readHead?.(${conversationId})){_store.get(${conversationId})===_state&&_store.delete(${conversationId});return}if(${manager}.getConversation(${conversationId})?.threadRuntimeStatus?.type==="active"){_schedule();return}try{await ${manager}.startEmptyTurn(${conversationId},{resumeSource:"executor",turnTrigger:"${DIRECT_RETRY_TRIGGER}"})}catch{}if(_store.get(${conversationId})!==_state)return;if((${manager}.getTurn?.(${conversationId},_state.turnId)?.status??${turn}.status)!=="failed"||${manager}.turnCoordinator?.readHead?.(${conversationId})){_store.delete(${conversationId});return}_schedule()};_store.set(${conversationId},_state),_schedule();return!0})()&&`;
+  const c = conversationId;
+  const m = manager;
+  const t = turn;
+  const continuation = `[{type:"text",text:${JSON.stringify(RATE_LIMIT_CONTINUATION_TEXT)},text_elements:[]}]`;
+  return (
+    `(()=>{let _store=globalThis.${BACKGROUND_RETRY_MARKER}??(globalThis.${BACKGROUND_RETRY_MARKER}=new Map()),_old=_store.get(${c});` +
+    `if(${t}.status==="completed"){_old?.timer!=null&&clearTimeout(_old.timer),_store.delete(${c});return!0}` +
+    // 结构体错误码（如 {responseStreamDisconnected:{...}}）取变体名参与匹配。
+    `let _error=${t}.error,_info=_error?.codexErrorInfo,_code=_info!=null&&typeof _info==="object"?Object.keys(_info)[0]:_info,` +
+    `_detail=String(_code??"")+" "+String(_error?.message??""),` +
+    `_rateLimited=${t}.status==="failed"&&(_code==="rateLimitExceeded"||/rate limit exceeded/i.test(_detail)),` +
+    `_retryable=_rateLimited||${t}.status==="failed"&&(_code==="serverOverloaded"||/currently experiencing high demand|server[ _-]?overload|temporary errors?|response(?:stream)?(?:connection)?(?:failed|disconnected)|connection failure|too many failed attempts/i.test(_detail));` +
+    `if(!_retryable||${m}.getStreamRole(${c})?.role!=="owner"||${m}.turnCoordinator?.readHead?.(${c})){_old?.timer!=null&&clearTimeout(_old.timer),_store.delete(${c});return!0}` +
+    `if(_old?.turnId===${t}.id)return!0;_old?.timer!=null&&clearTimeout(_old.timer);` +
+    // prompted 沿失败链继承：续接文本已在历史中时，后续重试只需重跑空轮次。
+    `let _state={turnId:${t}.id,timer:null,prompted:_old?.prompted===!0},_delay=_rateLimited?${RATE_LIMIT_RETRY_DELAY_MS}:${BACKGROUND_RETRY_DELAY_MS},` +
+    `_schedule=()=>{_store.get(${c})===_state&&(_state.timer=setTimeout(_run,_delay))},` +
+    `_run=async()=>{let _current=_store.get(${c});if(_current!==_state)return;_current.timer=null;` +
+    `let _turn=${m}.getTurn?.(${c},_state.turnId);` +
+    `if((_turn?.status??${t}.status)!=="failed"||${m}.turnCoordinator?.readHead?.(${c})){_store.get(${c})===_state&&_store.delete(${c});return}` +
+    `if(${m}.getConversation(${c})?.threadRuntimeStatus?.type==="active"){_schedule();return}` +
+    `let _prompt=_rateLimited&&!_state.prompted,_options={resumeSource:"executor",turnTrigger:"${DIRECT_RETRY_TRIGGER}"};` +
+    `_prompt&&(_state.prompted=!0,_options.continuationInput=${continuation});` +
+    `try{await ${m}.startEmptyTurn(${c},_options)}catch{_prompt&&(_state.prompted=!1)}` +
+    `if(_store.get(${c})!==_state)return;` +
+    `if((${m}.getTurn?.(${c},_state.turnId)?.status??${t}.status)!=="failed"||${m}.turnCoordinator?.readHead?.(${c})){_store.delete(${c});return}` +
+    `_schedule()};` +
+    `_store.set(${c},_state),_schedule();return!0})()&&`
+  );
 }
 
 function removeLegacyBackgroundRetry(source) {
@@ -191,37 +227,45 @@ function removeLegacyBackgroundRetry(source) {
 }
 
 /**
+ * 已注入过的 bundle：用原来的变量名重新生成调度器并原地替换，使旧版本
+ * （递增退避、不识别限流等）直接升级；内容一致时视为已打补丁。
+ */
+function upgradeBackgroundRetry(source) {
+  const matches = [
+    ...source.matchAll(new RegExp(INJECTED_RETRY_PATTERN.source, "g")),
+  ];
+  if (matches.length !== 1) {
+    return {
+      status: "unexpected-retry-injection-count",
+      count: matches.length,
+      source,
+    };
+  }
+
+  const [block, conversationId, turn, manager] = matches[0];
+  const next = buildBackgroundRetryExpression({ conversationId, manager, turn });
+  if (next === block) {
+    return { status: "already-patched", source };
+  }
+
+  const start = matches[0].index;
+  const upgraded =
+    source.slice(0, start) + next + source.slice(start + block.length);
+  try {
+    parseCode(upgraded);
+  } catch (error) {
+    return { status: "parse-failed", error, source };
+  }
+  return { status: "patched", source: upgraded };
+}
+
+/**
  * 注入后台重试调度器。这里在应用的全局消息处理器中运行，不依赖当前 React
  * 视图是否挂载，因此后台会话与失焦窗口都能继续调度。
  */
 function patchInitialSource(source) {
   if (source.includes(BACKGROUND_RETRY_MARKER)) {
-    const legacyBackoffPattern =
-      /_state=\{turnId:([a-zA-Z0-9_$]+)\.id,attempt:\(_old\?\.attempt\?\?0\)\+1,timer:null\},_delay=\[3e3,5e3,1e4,2e4,3e4\]\[Math\.min\(_state\.attempt-1,4\)\]/g;
-    const legacyBackoffMatches = [
-      ...source.matchAll(new RegExp(legacyBackoffPattern.source, "g")),
-    ];
-    if (legacyBackoffMatches.length === 0) {
-      return { status: "already-patched", source };
-    }
-    if (legacyBackoffMatches.length !== 1) {
-      return {
-        status: "unexpected-retry-delay-count",
-        count: legacyBackoffMatches.length,
-        source,
-      };
-    }
-
-    const upgraded = source.replace(
-      legacyBackoffPattern,
-      `_state={turnId:${legacyBackoffMatches[0][1]}.id,timer:null},_delay=${BACKGROUND_RETRY_DELAY_MS}`,
-    );
-    try {
-      parseCode(upgraded);
-    } catch (error) {
-      return { status: "parse-failed", error, source };
-    }
-    return { status: "patched", source: upgraded };
+    return upgradeBackgroundRetry(source);
   }
 
   let patched = removeLegacyBackgroundRetry(source);
@@ -332,8 +376,8 @@ function main() {
       failed++;
       continue;
     }
-    if (result.status === "unexpected-retry-delay-count") {
-      console.log(`  [x] ${label}: fixed-delay migration anchor count is ${result.count}`);
+    if (result.status === "unexpected-retry-injection-count") {
+      console.log(`  [x] ${label}: injected retry scheduler count is ${result.count}`);
       failed++;
       continue;
     }
@@ -404,6 +448,8 @@ module.exports = {
   BACKGROUND_RETRY_DELAY_MS,
   DIRECT_RETRY_TRIGGER,
   LEGACY_CONTINUATION_INPUT,
+  RATE_LIMIT_CONTINUATION_TEXT,
+  RATE_LIMIT_RETRY_DELAY_MS,
   buildBackgroundRetryExpression,
   patchInitialSource,
   patchMainSource,

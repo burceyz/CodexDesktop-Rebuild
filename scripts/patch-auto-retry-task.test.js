@@ -9,11 +9,16 @@ const {
   BACKGROUND_RETRY_DELAY_MS,
   DIRECT_RETRY_TRIGGER,
   LEGACY_CONTINUATION_INPUT,
+  RATE_LIMIT_CONTINUATION_TEXT,
+  RATE_LIMIT_RETRY_DELAY_MS,
   buildBackgroundRetryExpression,
   patchInitialSource,
   patchMainSource,
   patchPrimarySource,
 } = require("./patch-auto-retry-task");
+
+const RATE_LIMIT_MESSAGE =
+  "rate limit exceeded: Your requests to gpt-6-astra for gpt-6-astra in eastus2 have exceeded rate limit.";
 
 function createInitialBundle({ executorResume = false } = {}) {
   const manager = executorResume
@@ -77,6 +82,35 @@ function createLegacyBackgroundInjection() {
   ].join("");
 }
 
+// 上一版（固定 3 秒、不识别限流）生成的调度器，变量与 createInitialBundle 一致。
+function createPreviousRetryInjection() {
+  return [
+    '(()=>{let _store=globalThis.__codexDirectRetryState??(globalThis.__codexDirectRetryState=new Map()),_old=_store.get(c);',
+    'if(s.status==="completed"){_old?.timer!=null&&clearTimeout(_old.timer),_store.delete(c);return!0}',
+    'let _error=s.error,_detail=String(_error?.codexErrorInfo??"")+" "+String(_error?.message??""),',
+    '_retryable=s.status==="failed"&&(_error?.codexErrorInfo==="serverOverloaded"||/currently experiencing high demand|server[ _-]?overload|temporary errors?|response(?:stream)?(?:connection)?(?:failed|disconnected)|connection failure|too many failed attempts/i.test(_detail));',
+    'if(!_retryable||r.getStreamRole(c)?.role!=="owner"||r.turnCoordinator?.readHead?.(c)){_old?.timer!=null&&clearTimeout(_old.timer),_store.delete(c);return!0}',
+    'if(_old?.turnId===s.id)return!0;_old?.timer!=null&&clearTimeout(_old.timer);',
+    'let _state={turnId:s.id,timer:null},_delay=3000,_schedule=()=>{_store.get(c)===_state&&(_state.timer=setTimeout(_run,_delay))},',
+    '_run=async()=>{let _current=_store.get(c);if(_current!==_state)return;_current.timer=null;let _turn=r.getTurn?.(c,_state.turnId);',
+    'if((_turn?.status??s.status)!=="failed"||r.turnCoordinator?.readHead?.(c)){_store.get(c)===_state&&_store.delete(c);return}',
+    'if(r.getConversation(c)?.threadRuntimeStatus?.type==="active"){_schedule();return}',
+    'try{await r.startEmptyTurn(c,{resumeSource:"executor",turnTrigger:"capacity_retry_automatic"})}catch{}if(_store.get(c)!==_state)return;',
+    'if((r.getTurn?.(c,_state.turnId)?.status??s.status)!=="failed"||r.turnCoordinator?.readHead?.(c)){_store.delete(c);return}',
+    '_schedule()};_store.set(c,_state),_schedule();return!0})()&&',
+  ].join("");
+}
+
+// 同一锚点上 patch-auto-chat-loop 追加的钩子，升级时必须原样保留。
+const AUTO_CHAT_HOOK = "(globalThis.__codexAutoChat?.onTurnCompleted(c,s.status),!0)&&";
+
+function createPreviouslyPatchedBundle(injection = createPreviousRetryInjection()) {
+  return createInitialBundle().replace(
+    "i.events.emitTurnCompleted",
+    `${injection}${AUTO_CHAT_HOOK}i.events.emitTurnCompleted`,
+  );
+}
+
 function evaluateRetryExpression(context) {
   const expression = buildBackgroundRetryExpression({
     conversationId: "conversationId",
@@ -89,20 +123,22 @@ function evaluateRetryExpression(context) {
 function createRetryContext({ error, queued = false } = {}) {
   const timers = [];
   const started = [];
-  const state = { active: false };
+  const state = { active: false, startError: null };
   const queueState = { queued };
   const turn = {
     id: "turn-1",
     status: "failed",
     error,
   };
+  const turns = new Map([[turn.id, turn]]);
   const manager = {
     getStreamRole: () => ({ role: "owner" }),
-    getTurn: (_conversationId, turnId) => (turnId === turn.id ? turn : null),
+    getTurn: (_conversationId, turnId) => turns.get(turnId) ?? null,
     getConversation: () => ({
       threadRuntimeStatus: { type: state.active ? "active" : "idle" },
     }),
     startEmptyTurn: async (...args) => {
+      if (state.startError) throw state.startError;
       started.push(args);
       state.active = true;
     },
@@ -123,20 +159,34 @@ function createRetryContext({ error, queued = false } = {}) {
     },
     turn,
   };
+  // 模拟重试轮次结束：上一轮次运行完毕，新的失败轮次触发 turn/completed。
+  const failNextTurn = (id, nextError = error) => {
+    const next = { id, status: "failed", error: nextError };
+    turns.set(id, next);
+    state.active = false;
+    context.turn = next;
+    return evaluateRetryExpression(context);
+  };
 
-  return { context, manager, queueState, started, state, timers, turn };
+  return { context, failNextTurn, manager, queueState, started, state, timers, turn };
 }
 
-test("后台补丁挂在 turn/completed 链路且不注入续接消息", () => {
+function lastTimer(timers) {
+  return timers.at(-1);
+}
+
+test("后台补丁挂在 turn/completed 链路，续接文本只用于限流", () => {
   const result = patchInitialSource(createInitialBundle());
 
   assert.equal(result.status, "patched");
   assert.match(result.source, new RegExp(BACKGROUND_RETRY_MARKER));
   assert.match(
     result.source,
-    /r\.startEmptyTurn\(c,\{resumeSource:"executor",turnTrigger:"capacity_retry_automatic"\}\)/,
+    /_options=\{resumeSource:"executor",turnTrigger:"capacity_retry_automatic"\}/,
   );
-  assert.doesNotMatch(result.source, /continuationInput/);
+  assert.match(result.source, /r\.startEmptyTurn\(c,_options\)/);
+  assert.match(result.source, /_prompt=_rateLimited&&!_state\.prompted/);
+  assert.match(result.source, new RegExp(RATE_LIMIT_CONTINUATION_TEXT));
   assert.doesNotMatch(result.source, /继续未完成的工作/);
   assert.doesNotThrow(() =>
     acorn.parse(result.source, { ecmaVersion: "latest", sourceType: "script" }),
@@ -147,17 +197,44 @@ test("后台补丁挂在 turn/completed 链路且不注入续接消息", () => {
   assert.equal(second.source, result.source);
 });
 
-test("已生成的递增退避补丁会迁移为固定 3 秒", () => {
-  const fixed = patchInitialSource(createInitialBundle()).source;
-  const legacy = fixed.replace(
+test("上一版固定 3 秒调度器原地升级，保留同锚点的自动续聊钩子", () => {
+  const source = createPreviouslyPatchedBundle();
+  const result = patchInitialSource(source);
+  const expected = createPreviouslyPatchedBundle(
+    buildBackgroundRetryExpression({ conversationId: "c", manager: "r", turn: "s" }),
+  );
+
+  assert.equal(result.status, "patched");
+  assert.equal(result.source, expected);
+  assert.doesNotThrow(() =>
+    acorn.parse(result.source, { ecmaVersion: "latest", sourceType: "script" }),
+  );
+  assert.equal(patchInitialSource(result.source).status, "already-patched");
+});
+
+test("递增退避版本同样整体升级为当前调度器", () => {
+  const legacy = createPreviousRetryInjection().replace(
     "_state={turnId:s.id,timer:null},_delay=3000",
     "_state={turnId:s.id,attempt:(_old?.attempt??0)+1,timer:null},_delay=[3e3,5e3,1e4,2e4,3e4][Math.min(_state.attempt-1,4)]",
   );
-  const result = patchInitialSource(legacy);
+  assert.notEqual(legacy, createPreviousRetryInjection());
+  const result = patchInitialSource(createPreviouslyPatchedBundle(legacy));
 
   assert.equal(result.status, "patched");
-  assert.match(result.source, /_state=\{turnId:s\.id,timer:null\},_delay=3000/);
   assert.doesNotMatch(result.source, /\[3e3,5e3,1e4,2e4,3e4\]/);
+  assert.match(
+    result.source,
+    new RegExp(`_delay=_rateLimited\\?${RATE_LIMIT_RETRY_DELAY_MS}:${BACKGROUND_RETRY_DELAY_MS}`),
+  );
+});
+
+test("已注入调度器数量异常时拒绝升级", () => {
+  const injection = createPreviousRetryInjection();
+  const source = createPreviouslyPatchedBundle(`${injection}${injection}`);
+  const result = patchInitialSource(source);
+
+  assert.equal(result.status, "unexpected-retry-injection-count");
+  assert.equal(result.count, 2);
 });
 
 test("新版恢复链路使用 executor，而不依赖 view", () => {
@@ -236,7 +313,7 @@ test("旧版后台注入会被替换为新的直接重试调度器", () => {
   assert.equal(result.status, "patched");
   assert.match(result.source, new RegExp(BACKGROUND_RETRY_MARKER));
   assert.doesNotMatch(result.source, /__codexAutoRetries/);
-  assert.doesNotMatch(result.source, /continuationInput/);
+  assert.doesNotMatch(result.source, /继续未完成的工作/);
 });
 
 test("无法准确移除旧版后台注入时明确失败", () => {
@@ -267,6 +344,89 @@ test("高负载失败固定每 3 秒在后台直接启动空轮次", async () =>
   assert.equal(fixture.timers[1].delay, BACKGROUND_RETRY_DELAY_MS);
 });
 
+test("限流失败等待 30 秒后发送一次续接文本", async () => {
+  const fixture = createRetryContext({
+    error: { codexErrorInfo: "rateLimitExceeded", message: RATE_LIMIT_MESSAGE },
+  });
+
+  assert.equal(evaluateRetryExpression(fixture.context), true);
+  assert.equal(fixture.timers.length, 1);
+  assert.equal(fixture.timers[0].delay, RATE_LIMIT_RETRY_DELAY_MS);
+
+  await fixture.timers[0].callback();
+  assert.equal(fixture.started.length, 1);
+  const options = fixture.started[0][1];
+  assert.equal(options.resumeSource, "executor");
+  assert.equal(options.turnTrigger, DIRECT_RETRY_TRIGGER);
+  assert.deepEqual(JSON.parse(JSON.stringify(options.continuationInput)), [
+    { type: "text", text: RATE_LIMIT_CONTINUATION_TEXT, text_elements: [] },
+  ]);
+  // 续接轮次运行期间按限流间隔轮询，不会再次发送。
+  assert.equal(lastTimer(fixture.timers).delay, RATE_LIMIT_RETRY_DELAY_MS);
+  await lastTimer(fixture.timers).callback();
+  assert.equal(fixture.started.length, 1);
+});
+
+test("同一失败链只发送一次续接文本，之后直接重跑空轮次", async () => {
+  // 只有消息文本、没有 codexErrorInfo 时同样按限流处理。
+  const fixture = createRetryContext({ error: { message: RATE_LIMIT_MESSAGE } });
+
+  evaluateRetryExpression(fixture.context);
+  await fixture.timers[0].callback();
+  assert.equal(fixture.started.length, 1);
+  assert.ok(fixture.started[0][1].continuationInput);
+
+  const polling = lastTimer(fixture.timers);
+  fixture.failNextTurn("turn-2");
+  assert.equal(polling.cancelled, true);
+  assert.equal(lastTimer(fixture.timers).delay, RATE_LIMIT_RETRY_DELAY_MS);
+
+  await lastTimer(fixture.timers).callback();
+  assert.equal(fixture.started.length, 2);
+  assert.equal("continuationInput" in fixture.started[1][1], false);
+
+  // 失败链因成功而结束后，下一次限流重新发送续接文本。
+  fixture.context.turn = { id: "turn-3", status: "completed", error: null };
+  evaluateRetryExpression(fixture.context);
+  fixture.failNextTurn("turn-4");
+  await lastTimer(fixture.timers).callback();
+  assert.equal(fixture.started.length, 3);
+  assert.ok(fixture.started[2][1].continuationInput);
+});
+
+test("续接轮次启动失败时，下次重试仍会发送续接文本", async () => {
+  const fixture = createRetryContext({
+    error: { codexErrorInfo: "rateLimitExceeded", message: RATE_LIMIT_MESSAGE },
+  });
+  fixture.state.startError = new Error("thread not ready");
+
+  evaluateRetryExpression(fixture.context);
+  await fixture.timers[0].callback();
+  assert.equal(fixture.started.length, 0);
+
+  fixture.state.startError = null;
+  await lastTimer(fixture.timers).callback();
+  assert.equal(fixture.started.length, 1);
+  assert.ok(fixture.started[0][1].continuationInput);
+});
+
+test("结构体错误码按变体名识别断流，并按 3 秒直接重试", async () => {
+  const fixture = createRetryContext({
+    error: {
+      codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: null } },
+      message: "stream disconnected before completion: error decoding response body",
+    },
+  });
+
+  evaluateRetryExpression(fixture.context);
+  assert.equal(fixture.timers.length, 1);
+  assert.equal(fixture.timers[0].delay, BACKGROUND_RETRY_DELAY_MS);
+
+  await fixture.timers[0].callback();
+  assert.equal(fixture.started.length, 1);
+  assert.equal("continuationInput" in fixture.started[0][1], false);
+});
+
 test("重试表达式不保留递增退避间隔", () => {
   const expression = buildBackgroundRetryExpression({
     conversationId: "conversationId",
@@ -274,7 +434,10 @@ test("重试表达式不保留递增退避间隔", () => {
     turn: "turn",
   });
 
-  assert.match(expression, /_delay=3000/);
+  assert.match(
+    expression,
+    new RegExp(`_delay=_rateLimited\\?${RATE_LIMIT_RETRY_DELAY_MS}:${BACKGROUND_RETRY_DELAY_MS},`),
+  );
   assert.doesNotMatch(expression, /\[3e3,5e3,1e4,2e4,3e4\]/);
   assert.doesNotMatch(expression, /attempt:/);
 });
