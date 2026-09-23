@@ -10,6 +10,7 @@ const {
   ensureWindowsPortableLauncher,
   isRetryableHdiutilError,
   keepUpstreamCodex,
+  overlayPatchedExternalResources,
   patchWindowsAsarIntegrity,
 } = require("./build-from-upstream");
 const {
@@ -176,4 +177,33 @@ test("保留上游 CLI 时不会改写二进制", (t) => {
     () => keepUpstreamCodex("linux-x64", directory, "codex"),
     /cannot use a replacement CLI/,
   );
+});
+
+test("直打包流程覆盖 ASAR 外的插件与 CUA 补丁", (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "codex-external-overlay-test-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+
+  const platformDir = path.join(directory, "platform");
+  const resourcesDir = path.join(directory, "resources");
+  for (const relativePath of [
+    path.join("plugins", "browser-service.mjs"),
+    path.join("cua_node", "runtime.js"),
+  ]) {
+    fs.mkdirSync(path.dirname(path.join(platformDir, relativePath)), { recursive: true });
+    fs.mkdirSync(path.dirname(path.join(resourcesDir, relativePath)), { recursive: true });
+    fs.writeFileSync(path.join(platformDir, relativePath), `patched:${relativePath}`);
+    fs.writeFileSync(path.join(resourcesDir, relativePath), `upstream:${relativePath}`);
+  }
+  fs.writeFileSync(path.join(resourcesDir, "unrelated.txt"), "keep");
+
+  assert.equal(overlayPatchedExternalResources(platformDir, resourcesDir), 2);
+  assert.equal(
+    fs.readFileSync(path.join(resourcesDir, "plugins", "browser-service.mjs"), "utf8"),
+    `patched:${path.join("plugins", "browser-service.mjs")}`,
+  );
+  assert.equal(
+    fs.readFileSync(path.join(resourcesDir, "cua_node", "runtime.js"), "utf8"),
+    `patched:${path.join("cua_node", "runtime.js")}`,
+  );
+  assert.equal(fs.readFileSync(path.join(resourcesDir, "unrelated.txt"), "utf8"), "keep");
 });

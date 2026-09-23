@@ -20,7 +20,7 @@
  * 完全无感；病态场景（扫盘）命令被截停，走现成的 success:false 错误路径，
  * 任务报错但应用不死。
  *
- * 锚点：`maxOutputBytes:l,collectOutput:u=!0`（每个 bundle 内唯一）。
+ * 锚点：`maxOutputBytes:<变量>,collectOutput:<变量>=!0`（每个 bundle 内唯一）。
  * 同一 git 执行器还以副本形式打进了 src-*.js（其他进程用的共享库），
  * 一并覆盖；无锚点的 src-*.js 自动跳过。
  * 幂等：已含默认值即跳过。写入前 acorn 校验。
@@ -34,8 +34,11 @@ const path = require("path");
 const acorn = require("acorn");
 const { relPath, SRC_DIR } = require("./patch-util");
 
-const ANCHOR_OLD = "maxOutputBytes:l,collectOutput:u=!0";
-const ANCHOR_NEW = "maxOutputBytes:l=33554432,collectOutput:u=!0";
+const CAP_BYTES = 33554432;
+const ANCHOR_OLD_RE =
+  /maxOutputBytes:([A-Z_$a-z][\w$]*),collectOutput:([A-Z_$a-z][\w$]*)=!0/g;
+const ANCHOR_NEW_RE =
+  /maxOutputBytes:([A-Z_$a-z][\w$]*)=33554432,collectOutput:([A-Z_$a-z][\w$]*)=!0/g;
 
 function parseOk(code) {
   try {
@@ -51,14 +54,36 @@ function parseOk(code) {
   }
 }
 
-function count(haystack, needle) {
-  let c = 0;
-  let i = 0;
-  while ((i = haystack.indexOf(needle, i)) !== -1) {
-    c++;
-    i += needle.length;
+function patchSource(source) {
+  ANCHOR_NEW_RE.lastIndex = 0;
+  if (ANCHOR_NEW_RE.test(source)) {
+    return { status: "already-patched", source, count: 0 };
   }
-  return c;
+
+  ANCHOR_OLD_RE.lastIndex = 0;
+  const matches = [...source.matchAll(ANCHOR_OLD_RE)];
+  if (matches.length === 0) {
+    if (
+      source.includes("maxOutputBytes") &&
+      source.includes("collectOutput") &&
+      source.includes("outputLimitExceeded")
+    ) {
+      return { status: "unexpected-shape", source, count: 0 };
+    }
+    return { status: "not-applicable", source, count: 0 };
+  }
+  if (matches.length !== 1) {
+    return { status: "unexpected-anchor-count", source, count: matches.length };
+  }
+
+  const next = source.replace(
+    ANCHOR_OLD_RE,
+    `maxOutputBytes:$1=${CAP_BYTES},collectOutput:$2=!0`,
+  );
+  if (!parseOk(next)) {
+    return { status: "invalid-output", source, count: 1 };
+  }
+  return { status: "patched", source: next, count: 1 };
 }
 
 function main() {
@@ -90,32 +115,38 @@ function main() {
   }
 
   let patched = 0;
+  let failed = 0;
   for (const bundle of bundles) {
     const code = fs.readFileSync(bundle.path, "utf-8");
 
-    if (code.includes(ANCHOR_NEW)) {
+    const result = patchSource(code);
+    if (result.status === "already-patched") {
       console.log(`  [ok] ${relPath(bundle.path)}: already patched`);
       continue;
     }
-
-    const n = count(code, ANCHOR_OLD);
-    if (n === 0) {
+    if (result.status === "not-applicable") {
       console.log(`  [--] ${relPath(bundle.path)}: no git executor here, skipping`);
       continue;
     }
-    if (n !== 1) {
+    if (result.status === "unexpected-shape") {
       console.log(
-        `  [!] ${relPath(bundle.path)}: expected exactly 1 anchor, found ${n}, skipping`,
+        `  [x] ${relPath(bundle.path)}: git executor found but output-cap anchor changed`,
       );
+      failed++;
       continue;
     }
-
-    const next = code.replace(ANCHOR_OLD, ANCHOR_NEW);
-
-    if (!parseOk(next)) {
+    if (result.status === "unexpected-anchor-count") {
+      console.log(
+        `  [!] ${relPath(bundle.path)}: expected exactly 1 anchor, found ${result.count}, skipping`,
+      );
+      failed++;
+      continue;
+    }
+    if (result.status === "invalid-output") {
       console.log(
         `  [x] ${relPath(bundle.path)}: post-patch parse failed, aborting`,
       );
+      failed++;
       continue;
     }
 
@@ -126,7 +157,7 @@ function main() {
       continue;
     }
 
-    fs.writeFileSync(bundle.path, next);
+    fs.writeFileSync(bundle.path, result.source);
     console.log(
       `  [ok] ${relPath(bundle.path)}: default git output cap 32MB added`,
     );
@@ -134,6 +165,9 @@ function main() {
   }
 
   console.log(`  [done] ${patched} file(s) patched`);
+  if (failed > 0) process.exitCode = 1;
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = { ANCHOR_NEW_RE, ANCHOR_OLD_RE, CAP_BYTES, patchSource };

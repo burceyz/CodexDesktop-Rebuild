@@ -29,14 +29,13 @@ const OLD_SNIPPET =
 const NEW_SNIPPET =
   "E=async(n,r,i,a)=>{let c=a?.hostId??v,o=a?.workspaceRoots??n.workspaceRoots??(c===`local`?(e.get(Oi)?.data?.roots??[]).filter(e=>e!=null&&e!==`~`):[]);o.length===0&&(o=[`~`]);let s=Ks(o),u=C(a),{context:f,goal:h}=await T(n,c),g=MF(f,c),E=!1,D=Dn(f.imageAttachments),O=e.get(Ok),k=er(f);try{let n=await FF({hostId:c,prompt:k,projectlessPrewarmReservation:_,workspaceRoots:o}),a=n.cwd??r,l=await AF({activeCollaborationMode:t,context:f,hostId:c,scope:e,serviceTier:y}),v=await Cg({context:f,prompt:k,workspaceRoots:n.workspaceRoots,cwd:a,hostId:c,agentMode:u.agentMode,permissionProfileId:u.permissionProfileId,serviceTier:l.serviceTier,collaborationMode:l.collaborationMode,memoryPreferences:O??void 0,workspaceKind:s?`projectless`:`project`,projectlessOutputDirectory:n.projectlessOutputDirectory,projectAssignment:n.projectAssignment})";
 
-function hasNativeWorkspaceRootPropagation(source) {
-  const fallbackHelper =
-    /function\s+[\w$]+\(([\w$]+),([\w$]+)\)\{return\s+\2\?\.workspaceRoots\?\?\1\.workspaceRoots\?\?\[`~`\]\}/;
+function hasNativeWorkspaceRootPropagation(source, relatedSource = source) {
+  const cwdResolver =
+    /function\s+[\w$]+\(\{[^}]*localConversationCwd:[\w$]+[^}]*workspaceRoots:[\w$]+[^}]*activeWorkspaceRoot:[\w$]+[^}]*canUseProjectlessThreads:[\w$]+[^}]*\}\)\{return/;
   return (
-    source.includes("active-workspace-roots") &&
-    source.includes("localConversationCwd:") &&
-    source.includes("activeWorkspaceRoot:") &&
-    fallbackHelper.test(source)
+    (source.includes("active-workspace-roots") ||
+      relatedSource.includes("active-workspace-roots")) &&
+    cwdResolver.test(source)
   );
 }
 
@@ -52,11 +51,23 @@ function findComposerBundles(platform) {
   for (const plat of getPlatforms(platform)) {
     const assetsDir = path.join(SRC_DIR, plat, "_asar", "webview", "assets");
     if (!fs.existsSync(assetsDir)) continue;
-    for (const file of fs.readdirSync(assetsDir)) {
-      if (!/^(?:composer|app-initial)-.*\.js$/.test(file)) continue;
+    const files = fs.readdirSync(assetsDir).filter((file) => file.endsWith(".js"));
+    const hasActiveWorkspaceRootsQuery = files.some((file) =>
+      fs
+        .readFileSync(path.join(assetsDir, file), "utf-8")
+        .includes("active-workspace-roots"),
+    );
+
+    for (const file of files) {
+      if (!/^(?:composer|app-(?:initial|primary))-.*\.js$/.test(file)) continue;
       const filePath = path.join(assetsDir, file);
       const source = fs.readFileSync(filePath, "utf-8");
-      if (hasNativeWorkspaceRootPropagation(source)) {
+      if (
+        hasNativeWorkspaceRootPropagation(
+          source,
+          hasActiveWorkspaceRootsQuery ? "active-workspace-roots" : "",
+        )
+      ) {
         targets.push({ platform: plat, path: filePath, source, native: true });
         continue;
       }

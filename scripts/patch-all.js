@@ -23,6 +23,7 @@ const PATCHES = [
   "patch-model-catalog-filter.js",
   "patch-model-picker-submenu.js",
   "patch-thread-file-manager-action.js",
+  "patch-browser-auth.js",
   "patch-plugin-auth.js",
   "patch-remote-control.js",
   "patch-composer-workspace-root.js",
@@ -75,7 +76,9 @@ function main() {
   }
 
   const total = PATCHES.length * targetPlatforms.length;
-  console.log(`\n== Summary: ${total - failed}/${total} succeeded ==`);
+  console.log(
+    `\n== Summary: ${total - failed}/${total} scripts completed without errors ==`,
+  );
   if (failed > 0) process.exit(1);
 }
 

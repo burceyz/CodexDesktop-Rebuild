@@ -3,10 +3,10 @@ const assert = require("node:assert/strict");
 
 const { patchSource } = require("./patch-model-picker-submenu");
 
-function createBundle(extraProps = "") {
+function createBundle(extraProps = "", trailingProps = "") {
   return [
     "function renderPicker(input){",
-    `const {ariaLabel:aria,label:label,value:value,children:children,disabled:disabled,${extraProps}contentClassName:contentClassName,flyoutHeader:flyoutHeader}=input;`,
+    `const {ariaLabel:aria,label:label,value:value,children:children,disabled:disabled,${extraProps}contentClassName:contentClassName,flyoutHeader:flyoutHeader${trailingProps}}=input;`,
     "let inline=submenu;if(nativeInline())return inline;let flyout;",
     "return flyout;",
     "}",
@@ -16,6 +16,10 @@ function createBundle(extraProps = "") {
 for (const [name, source] of [
   ["旧版参数结构", createBundle()],
   ["含 labelOnly 的新版参数结构", createBundle("labelOnly:labelOnly,")],
+  [
+    "含 onOpenChange 的新版参数结构",
+    createBundle("labelOnly:labelOnly,", ",onOpenChange:onOpenChange"),
+  ],
 ]) {
   test(`模型选择器子菜单补丁兼容${name}`, () => {
     const result = patchSource(source);
