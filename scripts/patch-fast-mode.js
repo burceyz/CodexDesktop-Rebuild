@@ -1,22 +1,13 @@
 #!/usr/bin/env node
 /**
- * Post-build patch: Force-enable Fast mode (speed selector)
+ * 构建后补丁：为 API key 登录启用 Fast mode（速度选择器）。
  *
- * The speed selector and request-time service_tier plumbing are gated by
- * authMethod === "chatgpt" checks. API-key users never see/use it because
- * their authMethod differs.
+ * 上游会用 authMethod 或保存认证结果的局部变量限制速度选择器及
+ * service_tier 读取。补丁覆盖以下两类判断，并且只额外放行 apikey：
+ *   X !== "chatgpt"  -> X !== "chatgpt" && X !== "apikey"
+ *   X === "chatgpt"  -> X === "chatgpt" || X === "apikey"
  *
- * This patch locates BinaryExpression nodes matching the old gate:
- *   X.authMethod !== "chatgpt"
- * inside functions that also reference "fast_mode", and replaces
- * the comparison with !1 (always false), removing the auth gate.
- *
- * It also handles the newer gate shape:
- *   X.authMethod === "chatgpt"
- *   authMethod === "chatgpt"
- * inside fast_mode functions, and expands it to also allow "apikey".
- *
- * Target: chunks containing "fast_mode" + "chatgpt".
+ * 目标：同时包含 "fast_mode" 与 "chatgpt" 的渲染进程代码块。
  */
 const fs = require("fs");
 const path = require("path");
@@ -57,8 +48,7 @@ function expressionSourceForApiKeySide(binary, source) {
 }
 
 function isAlreadyExpandedToApiKey(parent, source) {
-  if (!parent || parent.type !== "LogicalExpression" || parent.operator !== "||")
-    return false;
+  if (!parent || parent.type !== "LogicalExpression") return false;
   return source.slice(parent.start, parent.end).includes("apikey");
 }
 
@@ -66,7 +56,7 @@ function collectPatches(ast, source) {
   const patches = [];
 
   walk(ast, (node) => {
-    // Match function bodies containing both authMethod and fast_mode
+    // 只在同时包含认证判断和 fast_mode 的函数内改写，避免误伤普通字符串比较。
     const isFn =
       node.type === "FunctionDeclaration" ||
       node.type === "FunctionExpression" ||
@@ -81,34 +71,32 @@ function collectPatches(ast, source) {
 
       const childSrc = source.slice(child.start, child.end);
 
-      // Old shape: X.authMethod !== "chatgpt" gates the fast-mode selector.
+      // 旧版和新版都可能先把 authMethod 保存到局部变量再进行排除判断。
       if (child.operator === "!==") {
-        if (!childSrc.includes("authMethod") || !childSrc.includes("chatgpt"))
-          return;
+        const apiKeySide = expressionSourceForApiKeySide(child, source);
+        if (apiKeySide == null) return;
+        if (isAlreadyExpandedToApiKey(parent, source)) return;
 
-        if (childSrc === "!1") return;
-
-        // Avoid duplicate patches at same offset
+        // 同一函数可能被外层函数再次遍历，按偏移去重。
         if (patches.some((p) => p.start === child.start)) return;
 
         patches.push({
           id: "fast_mode_auth_gate",
           start: child.start,
           end: child.end,
-          replacement: "!1",
+          replacement: `${childSrc}&&${apiKeySide}!==\`apikey\``,
           original: childSrc,
         });
         return;
       }
 
-      // New shape: authMethod === "chatgpt" or authKind === "chatgpt".
-      // Expand it to allow API-key auth as well.
+      // 肯定判断同样只额外允许 API key 登录。
       if (child.operator === "===") {
         const apiKeySide = expressionSourceForApiKeySide(child, source);
         if (apiKeySide == null) return;
         if (isAlreadyExpandedToApiKey(parent, source)) return;
 
-        // Avoid duplicate patches at same offset
+        // 同一函数可能被外层函数再次遍历，按偏移去重。
         if (patches.some((p) => p.start === child.start)) return;
 
         patches.push({
@@ -123,6 +111,69 @@ function collectPatches(ast, source) {
   });
 
   return patches;
+}
+
+function hasPatchedFastModeGate(ast, source) {
+  let found = false;
+  walk(ast, (node) => {
+    if (found) return;
+    const isFn =
+      node.type === "FunctionDeclaration" ||
+      node.type === "FunctionExpression" ||
+      node.type === "ArrowFunctionExpression";
+    if (!isFn) return;
+
+    const fnSource = source.slice(node.start, node.end);
+    if (!fnSource.includes("fast_mode") || !fnSource.includes("chatgpt")) return;
+    walk(node, (child, parent) => {
+      if (
+        child.type === "BinaryExpression" &&
+        expressionSourceForApiKeySide(child, source) != null &&
+        isAlreadyExpandedToApiKey(parent, source)
+      ) {
+        found = true;
+      }
+    });
+  });
+  return found;
+}
+
+function patchSource(source) {
+  if (!source.includes("fast_mode") || !source.includes("chatgpt")) {
+    return { status: "not-applicable", source, patches: [] };
+  }
+
+  let ast;
+  try {
+    ast = parse(source, { ecmaVersion: "latest", sourceType: "module" });
+  } catch (error) {
+    return { status: "parse-error", source, error };
+  }
+
+  const patches = collectPatches(ast, source).sort((a, b) => b.start - a.start);
+  if (patches.length === 0) {
+    return {
+      status: hasPatchedFastModeGate(ast, source)
+        ? "already-patched"
+        : "not-applicable",
+      source,
+      patches: [],
+    };
+  }
+
+  let code = source;
+  for (const patch of patches) {
+    code = code.slice(0, patch.start) + patch.replacement + code.slice(patch.end);
+  }
+
+  // 写回前重新解析，避免生成损坏的压缩代码。
+  try {
+    parse(code, { ecmaVersion: "latest", sourceType: "module" });
+  } catch (error) {
+    return { status: "invalid-output", source, patches, error };
+  }
+
+  return { status: "patched", source: code, patches };
 }
 
 function main() {
@@ -159,21 +210,33 @@ function main() {
 
   let totalPatched = 0;
   let totalFound = 0;
+  let failed = 0;
+  const relevantPlatforms = new Set();
 
   for (const bundle of targets) {
     const source = fs.readFileSync(bundle.path, "utf-8");
 
     const t0 = Date.now();
-    let ast;
-    try {
-      ast = parse(source, { ecmaVersion: "latest", sourceType: "module" });
-    } catch {
+    const result = patchSource(source);
+    if (result.status === "parse-error") {
+      console.log(`  [x] ${relPath(bundle.path)}: parse failed`);
+      failed++;
+      continue;
+    }
+    if (result.status === "already-patched") {
+      relevantPlatforms.add(bundle.platform);
+      continue;
+    }
+    if (result.status === "invalid-output") {
+      console.log(`  [x] ${relPath(bundle.path)}: patched output is invalid`);
+      failed++;
       continue;
     }
 
-    const patches = collectPatches(ast, source);
+    const patches = result.patches;
 
     if (patches.length === 0) continue;
+    relevantPlatforms.add(bundle.platform);
     totalFound += patches.length;
 
     console.log(
@@ -187,15 +250,11 @@ function main() {
       continue;
     }
 
-    patches.sort((a, b) => b.start - a.start);
-
-    let code = source;
     for (const p of patches) {
       console.log(`    * ${p.original} -> ${p.replacement}`);
-      code = code.slice(0, p.start) + p.replacement + code.slice(p.end);
     }
 
-    fs.writeFileSync(bundle.path, code, "utf-8");
+    fs.writeFileSync(bundle.path, result.source, "utf-8");
     totalPatched += patches.length;
   }
 
@@ -206,6 +265,16 @@ function main() {
   } else {
     console.log("  [ok] fast_mode auth gates already patched or absent");
   }
+
+  for (const currentPlatform of platforms) {
+    if (!relevantPlatforms.has(currentPlatform)) {
+      console.log(`  [x] [${currentPlatform}] no recognized fast_mode auth gate`);
+      failed++;
+    }
+  }
+  if (failed > 0) process.exitCode = 1;
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = { collectPatches, patchSource };

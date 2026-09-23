@@ -29,6 +29,7 @@ const acorn = require("acorn");
 const { locateBundles, relPath } = require("./patch-util");
 
 const MARKER = "__codex_bc_truncated";
+const NATIVE_MARKER = "codex_truncated_breadcrumb_data";
 
 // 内联注入的 beforeBreadcrumb：data 序列化超 4KB 就替换为占位符。
 // 任何异常（如循环引用）都吞掉并原样返回，绝不影响上报流程。
@@ -47,6 +48,15 @@ const TARGETS = [
   /^worker\.js$/,
   /^(?:workspace-root-drop-handler|window-all-closed)-.*\.js$/,
 ];
+
+function hasNativeScopeProtection(code) {
+  return (
+    code.includes(NATIVE_MARKER) &&
+    code.includes("beforeBreadcrumb:") &&
+    code.includes("scope_v3.json") &&
+    code.includes("2097152")
+  );
+}
 
 function patchOne(bundlePath, isCheck) {
   const code = fs.readFileSync(bundlePath, "utf-8");
@@ -103,23 +113,59 @@ function main() {
 
   let patched = 0;
   let found = 0;
+  const nativeBundles = locateBundles({
+    dir: "build",
+    pattern: /^bootstrap(?:-.*)?\.js$/,
+    platform,
+  }).filter((bundle) =>
+    hasNativeScopeProtection(fs.readFileSync(bundle.path, "utf-8")),
+  );
+  const nativePlatforms = new Set(nativeBundles.map((bundle) => bundle.platform));
 
-  for (const pattern of TARGETS) {
-    const bundles = locateBundles({ dir: "build", pattern, platform });
-    for (const bundle of bundles) {
-      found++;
-      if (patchOne(bundle.path, isCheck)) patched++;
+  for (const bundle of nativeBundles) {
+    console.log(
+      `  [ok] ${relPath(bundle.path)}: upstream truncates breadcrumb data and bounds scope_v3.json`,
+    );
+  }
+
+  const platforms = platform
+    ? [platform]
+    : ["mac-arm64", "mac-x64", "win"].filter(
+        (item) => !nativePlatforms.has(item),
+      );
+  for (const currentPlatform of platforms) {
+    if (nativePlatforms.has(currentPlatform)) continue;
+    for (const pattern of TARGETS) {
+      const bundles = locateBundles({
+        dir: "build",
+        pattern,
+        platform: currentPlatform,
+      });
+      for (const bundle of bundles) {
+        found++;
+        if (patchOne(bundle.path, isCheck)) patched++;
+      }
     }
   }
 
-  if (found === 0) {
+  if (found === 0 && nativeBundles.length === 0) {
     console.log("  [skip] no target bundles found");
     return;
   }
 
-  console.log(`  [done] ${patched} file(s) patched`);
+  console.log(
+    `  [done] native: ${nativeBundles.length}, patched: ${patched} file(s)`,
+  );
 }
 
 if (require.main === module) main();
 
-module.exports = { INIT_RE, MARKER, TARGETS, TRIM_FN, patchOne };
+module.exports = {
+  INIT_RE,
+  MARKER,
+  NATIVE_MARKER,
+  TARGETS,
+  TRIM_FN,
+  hasNativeScopeProtection,
+  patchOne,
+};

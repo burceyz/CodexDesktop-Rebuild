@@ -17,13 +17,24 @@ const acorn = require("acorn");
 const { locateBundles, relPath } = require("./patch-util");
 
 function hasNativeArchiveDelete(code) {
-  return [
+  const legacyMarkers = [
     "delete-archived-conversation",
     "delete-all-archived-conversations",
     "showDeleteButton",
     "settings.dataControls.archivedChats.deleteConfirm.title",
     "thread/delete",
-  ].every((marker) => code.includes(marker));
+  ];
+  const currentMarkers = [
+    "delete-archived-conversation",
+    "delete-archived-conversations",
+    "deleteArchivedConversation",
+    "deleteAllArchivedConversations",
+    "showDeleteButton",
+    "thread/delete",
+  ];
+  return [legacyMarkers, currentMarkers].some((markers) =>
+    markers.every((marker) => code.includes(marker)),
+  );
 }
 
 // ─── Layer 1: app-main route injection ──────────────────────────
