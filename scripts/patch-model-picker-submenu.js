@@ -21,7 +21,7 @@ const MARKER = "/* Codex：模型选择器改用稳定的点击展开。 */";
 const TARGET_SIGNATURES = [
   "FlyoutSubmenuItem",
   "flyoutHeader",
-  "chromeExtension:!0,extension:!0",
+  "data-model-picker-model-row",
   "contentClassName:`w-[233px]`",
 ];
 
@@ -30,7 +30,7 @@ const INLINE_BRANCH_RE =
   /let ([\w$]+)=([\w$]+);if\(([\w$]+)\(\)\)return \1;let ([\w$]+);/g;
 // labelOnly 是上游后来新增的可选属性，字段存在与否不应影响标签变量定位。
 const ROW_PROPS_RE =
-  /\{ariaLabel:[\w$]+,label:([\w$]+),value:[\w$]+,children:[\w$]+,disabled:[\w$]+,(?:labelOnly:[\w$]+,)?contentClassName:[\w$]+,flyoutHeader:[\w$]+\}=[\w$]+/g;
+  /\{ariaLabel:[\w$]+,label:([\w$]+),value:[\w$]+,children:[\w$]+,disabled:[\w$]+,(?:labelOnly:[\w$]+,)?contentClassName:[\w$]+,flyoutHeader:[\w$]+(?:,onOpenChange:[\w$]+)?\}=[\w$]+/g;
 const LEGACY_CONDITION_RE =
   /if\(([\w$]+)\(\)\|\|([\w$]+)\?\.props\?\.\[`data-model-picker-model-row`\]===!0\)/g;
 

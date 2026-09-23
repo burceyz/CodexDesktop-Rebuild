@@ -48,6 +48,8 @@ const REPLACEMENT =
   "return await hY(e.webContents.debugger.sendCommand(t,globalThis." +
   MARKER +
   "(t,n),i),this.cdpCommandTimeoutMs,";
+const DYNAMIC_ANCHOR_RE =
+  /return await ([A-Z_$a-z][\w$]*)\(([A-Z_$a-z][\w$]*)\.webContents\.debugger\.sendCommand\(([A-Z_$a-z][\w$]*),([A-Z_$a-z][\w$]*),([A-Z_$a-z][\w$]*)\),(this\.cdpCommandTimeoutMs|[A-Z_$a-z][\w$]*),/;
 
 function parseOk(code) {
   try {
@@ -61,6 +63,42 @@ function parseOk(code) {
       return false;
     }
   }
+}
+
+function patchSource(code) {
+  if (code.includes(MARKER)) {
+    return { status: "already-patched", source: code };
+  }
+
+  let forwarded = null;
+  if (code.includes(ANCHOR)) {
+    forwarded = code.replace(ANCHOR, REPLACEMENT);
+  } else {
+    forwarded = code.replace(
+      DYNAMIC_ANCHOR_RE,
+      (match, timeoutFn, webContents, method, params, sessionId, timeout) =>
+        `return await ${timeoutFn}(${webContents}.webContents.debugger.sendCommand(` +
+        `${method},globalThis.${MARKER}(${method},${params}),${sessionId}),${timeout},`,
+    );
+    if (forwarded === code) forwarded = null;
+  }
+
+  if (forwarded == null) {
+    const hasBrowserScreenshotPipeline =
+      code.includes("Page.captureScreenshot") &&
+      code.includes("captureBeyondViewport") &&
+      code.includes("sendDebuggerCommand");
+    return {
+      status: hasBrowserScreenshotPipeline ? "unexpected-shape" : "not-applicable",
+      source: code,
+    };
+  }
+
+  const next = GUARD_DEF + forwarded;
+  if (!parseOk(next)) {
+    return { status: "invalid-output", source: code };
+  }
+  return { status: "patched", source: next };
 }
 
 function main() {
@@ -82,39 +120,31 @@ function main() {
   }
 
   let patched = 0;
+  let failed = 0;
   for (const bundle of bundles) {
     const code = fs.readFileSync(bundle.path, "utf-8");
 
-    if (code.includes(MARKER)) {
+    const result = patchSource(code);
+    if (result.status === "already-patched") {
       console.log(`  [ok] ${relPath(bundle.path)}: already patched`);
       continue;
     }
-
-    // 锚点可能因不同平台的压缩变量名不同而变化，用正则放宽标识符
-    let next = null;
-    if (code.includes(ANCHOR)) {
-      next = GUARD_DEF + code.replace(ANCHOR, REPLACEMENT);
-    } else {
-      const re =
-        /return await ([\w$]+)\((\w+)\.webContents\.debugger\.sendCommand\((\w+),(\w+),(\w+)\),this\.cdpCommandTimeoutMs,/;
-      const m = code.match(re);
-      if (m) {
-        const rep = `return await ${m[1]}(${m[2]}.webContents.debugger.sendCommand(${m[3]},globalThis.${MARKER}(${m[3]},${m[4]}),${m[5]}),this.cdpCommandTimeoutMs,`;
-        next = GUARD_DEF + code.replace(re, rep);
-      }
-    }
-
-    if (next == null) {
-      console.log(
-        `  [!] ${relPath(bundle.path)}: CDP forward anchor not found, skipping`,
-      );
+    if (result.status === "not-applicable") {
+      console.log(`  [--] ${relPath(bundle.path)}: no CDP screenshot pipeline`);
       continue;
     }
-
-    if (!parseOk(next)) {
+    if (result.status === "unexpected-shape") {
+      console.log(
+        `  [x] ${relPath(bundle.path)}: CDP screenshot pipeline found but forward anchor changed`,
+      );
+      failed++;
+      continue;
+    }
+    if (result.status === "invalid-output") {
       console.log(
         `  [x] ${relPath(bundle.path)}: post-inject parse failed, aborting`,
       );
+      failed++;
       continue;
     }
 
@@ -125,7 +155,7 @@ function main() {
       continue;
     }
 
-    fs.writeFileSync(bundle.path, next);
+    fs.writeFileSync(bundle.path, result.source);
     console.log(
       `  [ok] ${relPath(bundle.path)}: CDP fullpage screenshot -> viewport jpeg q60`,
     );
@@ -133,6 +163,9 @@ function main() {
   }
 
   console.log(`  [done] ${patched} file(s) patched`);
+  if (failed > 0) process.exitCode = 1;
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = { DYNAMIC_ANCHOR_RE, GUARD_DEF, MARKER, patchSource };

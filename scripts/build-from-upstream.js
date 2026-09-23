@@ -93,6 +93,26 @@ function clearExistingAsarUnpacked(asarPath) {
   }
 }
 
+/**
+ * plugins 与 cua_node 位于 app.asar 外，补丁脚本修改的是 src/<platform>
+ * 中的规范副本。上游直打包流程先复制安装包缓存，因此必须再覆盖这两个目录，
+ * 否则外部运行时补丁不会进入最终产物。
+ */
+function overlayPatchedExternalResources(platformDir, resourcesDir) {
+  const resourceNames = ["plugins", "cua_node"];
+  let copied = 0;
+
+  for (const name of resourceNames) {
+    const source = path.join(platformDir, name);
+    if (!fs.existsSync(source)) continue;
+    const destination = path.join(resourcesDir, name);
+    copied += copyRecursive(source, destination);
+  }
+
+  console.log(`   [overlay] patched external resources (${copied} files)`);
+  return copied;
+}
+
 function isOwlRuntime(appDir) {
   return (
     fs.existsSync(path.join(appDir, "owl-shell-runtime.json")) &&
@@ -217,6 +237,9 @@ function buildMac(platform) {
 
   const resourcesDir = path.join(outApp, "Contents", "Resources");
 
+  // 外置插件与 CUA 运行时不在 ASAR 内，需显式带入补丁后的规范副本。
+  overlayPatchedExternalResources(platformDir, resourcesDir);
+
   // 3. Repack patched ASAR
   const asarPath = path.join(resourcesDir, "app.asar");
   console.log("   [asar pack] _asar/ -> app.asar");
@@ -303,6 +326,9 @@ function buildWin(platform) {
   copyRecursive(appDir, outApp);
 
   const resourcesDir = path.join(outApp, "resources");
+
+  // 外置插件与 CUA 运行时不在 ASAR 内，需显式带入补丁后的规范副本。
+  overlayPatchedExternalResources(platformDir, resourcesDir);
 
   // Compute old ASAR header hash (before repack)
   const asarPath = path.join(resourcesDir, "app.asar");
@@ -502,6 +528,7 @@ module.exports = {
   isOwlRuntime,
   isRetryableHdiutilError,
   keepUpstreamCodex,
+  overlayPatchedExternalResources,
   patchExeHash,
   patchWindowsAsarIntegrity,
 };
