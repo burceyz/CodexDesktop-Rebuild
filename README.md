@@ -39,6 +39,8 @@ npm run build:all
 - `src/<platform>/_asar` 是 ASAR 内资源的补丁目标。
 - `src/<platform>/plugins` 与 `src/<platform>/cua_node` 是 Browser / Computer Use 等外置运行时的补丁目标；直打包流程会显式覆盖这两个目录，避免重新复制上游安装包缓存时丢失补丁。
 - `patch-browser-auth.js` 兼容 API-key 登录：ChatGPT 身份与 request-header 策略可用时保持原行为；身份读取失败时仅关闭该可选请求头并继续本地浏览器通道，不会把 API key 伪装或发送为 ChatGPT token。
+- `patch-image-generation-auth.js` 兼容自定义 `base_url` 的 API-key 登录：仅对非 OpenAI/ChatGPT 官方地址为 app-server 注入 provider 认证、`image_gen` 能力参数，并在没有静态模型目录时启用远端模型发现；显式关闭项及已有 `model_catalog_json`/`model_catalog_url` 均优先，API key 只经子进程环境传递，不写入用户配置或命令行。
+- `patch-realtime-voice-auth.js` 为 API-key 登录放行实时语音入口；实时会话仍由 app-server 使用当前 model provider 的 `base_url` 与认证创建，ChatGPT 工作区能力的认证限制保持不变。
 - 上游更新后应先执行 `npm run patch -- --check` 或完整 `npm run patch`，再运行测试和构建。
 
 ## Development
